@@ -1,0 +1,15 @@
+[project]
+name = "gov-agentic"
+version = "0.1.0"
+description = "Gov Agentic pipeline with Langfuse observability"
+requires-python = ">=3.11"
+dependencies = [
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+    "python-dotenv",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

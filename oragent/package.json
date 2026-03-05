@@ -1,0 +1,21 @@
+{
+  "name": "oragent",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot src/index.ts"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.1",
+    "@langchain/openai": "^1.2",
+    "@langfuse/langchain": "^4.6.1",
+    "@langfuse/otel": "^4.6.1",
+    "@langfuse/tracing": "^4.6.1",
+    "@opentelemetry/api": "^1.9",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.57",
+    "@opentelemetry/sdk-node": "^0.213.0",
+    "@opentelemetry/sdk-trace-base": "^1.30",
+    "deepagents": "latest",
+    "langfuse": "^3.38.6"
+  }
+}
