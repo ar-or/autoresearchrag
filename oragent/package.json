@@ -6,6 +6,8 @@
     "dev": "bun --hot src/index.ts"
   },
   "dependencies": {
+    "@elastic/elasticsearch": "^9.3.4",
+    "@langchain/community": "^1.1.22",
     "@langchain/core": "^1.1",
     "@langchain/openai": "^1.2",
     "@langfuse/langchain": "^4.6.1",

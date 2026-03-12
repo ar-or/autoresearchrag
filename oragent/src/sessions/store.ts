@@ -1,7 +1,15 @@
+export interface RetrievedContext {
+  document_id: string;
+  text: string;
+  title: string;
+  score: number;
+}
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+  contexts?: RetrievedContext[];
 }
 
 export interface Session {

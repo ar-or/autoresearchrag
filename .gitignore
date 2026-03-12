@@ -50,3 +50,7 @@ out/
 # Coverage
 coverage/
 .nyc_output/
+
+# Evaluator data and predictions
+evaluators/*/data/
+evaluators/*/predictions/

@@ -52,13 +52,14 @@ export async function sendMessage(req: Request): Promise<Response> {
     timestamp: new Date().toISOString(),
   });
 
-  const response = await runAgent(session_id, message, session.messages.slice(0, -1));
+  const result = await runAgent(session_id, message, session.messages.slice(0, -1));
 
   sessionStore.addMessage(session_id, {
     role: "assistant",
-    content: response,
+    content: result.content,
     timestamp: new Date().toISOString(),
+    contexts: result.contexts,
   });
 
-  return json({ session_id, response });
+  return json({ session_id, response: result.content, contexts: result.contexts });
 }

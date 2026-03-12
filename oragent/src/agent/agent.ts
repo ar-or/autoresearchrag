@@ -1,9 +1,10 @@
 import { createLangfuseHandler } from "../tracing/otel";
-import type { ChatMessage } from "../sessions/store";
+import type { ChatMessage, RetrievedContext } from "../sessions/store";
 import { createDeepAgent } from "deepagents";
 import { ChatOpenAI } from "@langchain/openai";
 import { settings } from "../settings";
-import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
+import { HumanMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
+import { createRetrievalTool, retrieve } from "./retriever";
 
 function toLC(messages: ChatMessage[]) {
   return messages.map((m) =>
@@ -11,23 +12,43 @@ function toLC(messages: ChatMessage[]) {
   );
 }
 
+export interface AgentResult {
+  content: string;
+  contexts: RetrievedContext[];
+}
+
 export async function runAgent(
   sessionId: string,
   userMessage: string,
   history: ChatMessage[],
-): Promise<string> {
+): Promise<AgentResult> {
   const langfuseHandler = createLangfuseHandler(sessionId);
+  const retrievalTool = createRetrievalTool();
+
+  // Always retrieve before the agent runs
+  const contexts = await retrieve(userMessage);
+
+  // Build context block for the agent prompt
+  let augmentedMessage = userMessage;
+  if (contexts.length > 0) {
+    const contextBlock = contexts
+      .map((c, i) => `[${i + 1}] ${c.title ? c.title + ": " : ""}${c.text}`)
+      .join("\n\n");
+    augmentedMessage =
+      `Retrieved documents:\n${contextBlock}\n\nUser question: ${userMessage}`;
+  }
 
   try {
     const llm = new ChatOpenAI({ model: settings.model });
     const agent = createDeepAgent({
       model: llm,
       systemPrompt: settings.systemPrompt,
+      tools: [retrievalTool],
     });
 
     const messages = [
       ...toLC(history),
-      new HumanMessage(userMessage),
+      new HumanMessage(augmentedMessage),
     ];
 
     const result = await agent.invoke(
@@ -35,7 +56,31 @@ export async function runAgent(
       { callbacks: [langfuseHandler] },
     );
 
-    // DeepAgent returns { messages, todos, files } — extract last AI message
+    // Collect any additional contexts from agent tool calls
+    const additionalContexts: RetrievedContext[] = [];
+    if (result?.messages && Array.isArray(result.messages)) {
+      for (const msg of result.messages) {
+        const name = msg?.name ?? msg?.kwargs?.name ?? "";
+        if (msg instanceof ToolMessage || msg?.constructor?.name === "ToolMessage" || name === "search_documents") {
+          try {
+            const parsed = JSON.parse(msg.content as string);
+            if (Array.isArray(parsed)) {
+              for (const item of parsed) {
+                if (item?.text) {
+                  additionalContexts.push({
+                    document_id: item.document_id ?? "",
+                    text: item.text,
+                    title: item.title ?? "",
+                    score: item.score ?? 0,
+                  });
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+
     let content: string;
     if (result?.messages && Array.isArray(result.messages)) {
       const lastAI = [...result.messages].reverse().find(
@@ -48,22 +93,7 @@ export async function runAgent(
       content = result?.content ?? result?.output ?? JSON.stringify(result);
     }
 
-    return content;
-  } catch (err: any) {
-    // Fallback: use @langchain/openai directly if DeepAgent fails
-    console.error("DeepAgent error, falling back to ChatOpenAI:", err.message);
-    const llm = new ChatOpenAI({ model: settings.model });
-    const messages = [
-      new SystemMessage(settings.systemPrompt),
-      ...toLC(history),
-      new HumanMessage(userMessage),
-    ];
-    const response = await llm.invoke(messages, { callbacks: [langfuseHandler] });
-    const content =
-      typeof response.content === "string"
-        ? response.content
-        : JSON.stringify(response.content);
-    return content;
+    return { content, contexts: [...contexts, ...additionalContexts] };
   } finally {
     await langfuseHandler.shutdownAsync?.().catch(() => {});
   }
