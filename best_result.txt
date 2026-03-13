@@ -1,0 +1,10 @@
+status=uninitialized
+hypothesis_name=
+git_commit=
+time=
+elastic_index=
+finqa_n=30
+finqa_accuracy=
+finqa_correct=
+finqa_total_cost_usd=
+notes=Initialize from the first accepted N=30 FinQA run on develop.

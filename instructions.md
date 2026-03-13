@@ -1,14 +1,153 @@
+Runner Instructions
 
-Take the code
-- postulate an improvement hypothesis to the rag pipeline. Something you want to try that can improve the overall performance.
-- fork develop into a new git branch: feature_<hypothesis>
-- clone es index `mtrag` to feature_<hypothesis>
-- set environment variables N=30 ; ES_INDEX=feature_<hypothesis>
-- make changes to  agent.py or scripts/ingest.py according to the improvement hypothesis
-- Don't change the embedding model or the fact that embedding is resolved with sqlite cache.
-- if the ingestion changed in any way, delete from ES_INDEX index all documents related to finqa (where colelction_name=mycollection1) and reingest them with `evaluators/finqa/ingest_finqa.py`
-- run finqa evaluation with N=30 (but not mtrag and not hot hotpot and not any other evaluator)
-- record the score in results.csv 
-- merge results.csv into develop branch
-- if the finqa overall result better than best_result.txt -> override best_result.txt and merge current branch into develop so next experiment will start with this current changes as baseline
+Purpose
+- You are the runner/orchestrator.
+- Your job is to walk through `hypothesis_backlog.md` one hypothesis at a time, in order, and spawn a fresh sub-agent for each hypothesis.
+- The runner does not do research, implementation, evaluation, or judging itself. The runner delegates that full loop to the sub-agent.
+- Keep executor and judge together inside the same sub-agent.
 
+Primary Loop
+1. Read `hypothesis_backlog.md`.
+2. Walk through the hypothesis cards from top to bottom, one by one.
+3. For each hypothesis, check whether it has already been evaluated by looking in `results.csv`.
+4. If the hypothesis already has a completed row in `results.csv`, skip it and move to the next one.
+5. If the hypothesis has not been evaluated yet, spawn a new sub-agent for that hypothesis.
+6. Wait for that sub-agent to finish fully before moving to the next hypothesis.
+7. After the sub-agent finishes, refresh your view of:
+   - `develop`
+   - `results.csv`
+   - `best_result.txt`
+8. Then continue to the next hypothesis in `hypothesis_backlog.md`.
+
+Execution Rules For The Runner
+1. Process hypotheses sequentially. Do not run multiple hypotheses in parallel.
+2. Use a brand-new sub-agent for each hypothesis. Do not reuse the same sub-agent across multiple hypotheses.
+3. Pass only one hypothesis card to each sub-agent.
+4. Do not let a sub-agent invent a new hypothesis or combine multiple cards.
+5. The backlog order is the execution order unless the planner provided an explicit reordered list.
+6. If the planner provided a reordered list, still execute one hypothesis at a time and still use a fresh sub-agent per hypothesis.
+
+What The Runner Must Pass To Each Sub-Agent
+- The full hypothesis card.
+- The path to `hypothesis_backlog.md`.
+- The path to `results.csv`.
+- The path to `best_result.txt`.
+- The instruction that `develop` is the current baseline branch.
+- The instruction that the sub-agent owns both executor and judge responsibilities for that one hypothesis.
+
+Sub-Agent Mission
+- Execute exactly one hypothesis.
+- Implement the hypothesis.
+- Evaluate it on FinQA with `N=30`.
+- Judge it against the current champion in `best_result.txt`.
+- Record the result in `results.csv`.
+- If the hypothesis wins, update `best_result.txt` and merge the code into `develop`.
+- If it loses, do not merge the code into `develop`.
+
+Mandatory Rules The Runner Must Give To The Sub-Agent
+
+Scope and Constraints
+- One hypothesis per run. Do not bundle multiple unrelated ideas into one experiment.
+- Default editable files are `agent.py` and `scripts/ingest.py`.
+- If the hypothesis is specifically about FinQA document rendering, `evaluators/finqa/ingest_finqa.py` may also be changed.
+- Do not change evaluator scoring logic.
+- Do not change the embedding model.
+- Do not remove, bypass, or replace the sqlite embedding cache.
+- Prefer deterministic retrieval/indexing changes over adding extra LLM calls, unless the hypothesis explicitly requires the extra call.
+
+Branch and Index Setup
+1. Start from the latest `develop`.
+2. Create a branch named `feature_<hypothesis_slug>`.
+3. Clone Elasticsearch index `mtrag` into `feature_<hypothesis_slug>`.
+4. Set environment variables:
+   - `ES_INDEX=feature_<hypothesis_slug>`
+   - `N=30`
+5. Keep the hypothesis slug short, lowercase, and stable so the branch name, index name, and artifact path all match.
+
+Implementation Rules
+1. Implement the minimum code change needed to test the hypothesis.
+2. Keep the change attributable. If you catch yourself changing chunking, retrieval, and prompt behavior together, stop and split the work into separate hypotheses.
+3. If the hypothesis requires scope outside the allowed files, reject it as out of scope instead of widening scope ad hoc.
+4. Do not modify `results.csv` rows that already exist.
+
+Ingestion Rules
+1. If ingestion or document serialization changed in any way:
+   - delete all documents in `ES_INDEX` where `collection_name=mycollection1`
+   - reingest FinQA with `uv run python evaluators/finqa/ingest_finqa.py`
+2. If ingestion did not change, do not reingest.
+3. If chunk count explodes or collapses unexpectedly after an ingestion change, stop and record the run as rejected with the reason in `notes`.
+
+Evaluation Protocol
+1. Run exactly one FinQA evaluation with `N=30`.
+2. Do not run MT-RAG, HotpotQA, or any other evaluator unless the planner explicitly asked for it.
+3. Save the FinQA output artifact under `artifacts/<hypothesis_slug>/` and record the artifact path in `results.csv`.
+
+Recording Rules
+1. Append one row to `results.csv` for every evaluated hypothesis, including rejected runs.
+2. Always record:
+   - `hypothesis_name`
+   - `git_commit`
+   - `time`
+   - `elastic_index`
+   - `retrieval_k`
+   - `agent_mode`
+   - `finqa_n`
+   - `finqa_parallelism`
+   - `finqa_ok`
+   - `finqa_accuracy`
+   - `finqa_correct`
+   - `finqa_wall_clock_s`
+   - token and cost columns
+   - `finqa_artifact_path`
+   - `notes`
+3. Leave unrelated benchmark columns blank if they were not run.
+4. In `notes`, include:
+   - hypothesis id
+   - changed files
+   - `reingest=yes` or `reingest=no`
+   - one-sentence summary of what changed
+   - final judge decision
+
+Judge Rules
+1. Compare the experiment to the current champion in `best_result.txt`.
+2. Possible decisions are:
+   - `rejected`
+   - `promoted`
+3. Reject the experiment if any of the following is true:
+   - the run failed
+   - the result is worse than the champion
+   - the change cannot be attributed to a single hypothesis
+   - cost or latency increased materially without meaningful accuracy gain
+4. Treat ties as rejections.
+5. Promote if the challenger is better than the champion on the single `N=30` run and the win is explainable:
+   - the result is explainable from the hypothesis
+   - the cost increase is acceptable for the gain
+
+Merge Rules
+1. Merge the new `results.csv` row back into `develop` for every completed experiment.
+2. If the experiment is rejected, do not merge code into `develop`.
+3. If the experiment is promoted:
+   - update `best_result.txt`
+   - merge the experiment branch into `develop`
+   - use the promoted code as the new baseline for the next experiment
+
+Champion File
+- `best_result.txt` is the single source of truth for the current champion.
+- If `best_result.txt` is uninitialized, the first successful `N=30` FinQA run accepted on `develop` becomes the initial champion.
+
+Cleanup
+1. After recording results, clean up rejected branches and rejected ES indices unless they are needed for debugging.
+2. Keep accepted artifacts long enough to audit the promotion decision.
+3. If `develop` changed materially during the experiment, restart the hypothesis from the updated `develop`.
+
+Runner Completion Rule
+- The runner is done only after it has walked through the full backlog it was asked to process.
+
+Per-Hypothesis Completion Rule
+- A sub-agent is done only when all of the following are true:
+  - exactly one hypothesis was executed
+  - code changes are committed on the experiment branch
+  - FinQA evaluation completed or failed cleanly
+  - a row was appended to `results.csv`
+  - a judge decision was made
+  - `best_result.txt` was updated only if the hypothesis was promoted

@@ -1,6 +1,7 @@
 services:
   eval:
     build: .
+    working_dir: /home/rag
     network_mode: host
     stdin_open: true
     tty: true
@@ -8,6 +9,7 @@ services:
       - ORAGENT_URL=http://localhost:32522
       - ELASTIC_URL=http://localhost:9200
     volumes:
+      - .:/home/rag
       - ${HOME}/.codex/auth.json:/mnt/secrets/codex_auth.json:ro
       - ./github_deploy_key:/mnt/secrets/github_deploy_key:ro
       - ./.env:/app/.env:ro
