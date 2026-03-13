@@ -13,6 +13,6 @@ export const settings = {
   /** Elasticsearch retrieval */
   elasticUrl: process.env.ELASTIC_URL ?? "http://localhost:9200",
   elasticApiKey: process.env.ELASTIC_API_KEY ?? "",
-  elasticIndex: process.env.ELASTIC_INDEX ?? "mtrag",
+  elasticIndex: process.env.ES_INDEX ?? "mtrag",
   retrievalK: Number(process.env.RETRIEVAL_K ?? 5),
 } as const;

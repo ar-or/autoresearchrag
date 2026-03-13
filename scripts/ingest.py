@@ -11,7 +11,7 @@ Usage:
 
 Environment variables:
   ELASTIC_URL   - Elasticsearch URL (default: http://localhost:9200)
-  ELASTIC_INDEX - Index name (default: mtrag)
+  ES_INDEX      - Index name (default: mtrag)
   CHUNK_SIZE    - Characters per chunk (default: 512)
   CHUNK_OVERLAP - Overlap between chunks (default: 64)
 """
@@ -29,7 +29,7 @@ import requests
 from openai import OpenAI
 
 ELASTIC_URL = os.environ.get("ELASTIC_URL", "http://localhost:9200")
-ELASTIC_INDEX = os.environ.get("ELASTIC_INDEX", "mtrag")
+ELASTIC_INDEX = os.environ.get("ES_INDEX", "mtrag")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "64"))
 EMBED_MODEL = "text-embedding-3-small"

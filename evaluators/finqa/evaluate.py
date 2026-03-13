@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Evaluate oragent on FinQA – financial numerical reasoning.
-
-Each FinQA example contains a financial report (pre_text + table + post_text)
-and a question requiring numerical reasoning.  The gold answer is a number
-stored in qa.exe_ans.  We ask the agent to answer and compare numerically.
+"""Evaluate agent on FinQA – financial numerical reasoning.
 
 Environment variables:
-  ORAGENT_URL    - oragent base URL (default: http://localhost:32522)
-  FINQA_N        - max examples to evaluate (default: 20)
+  AGENT_MODE     - "local" (default) or "http"
+  ORAGENT_URL    - oragent base URL when AGENT_MODE=http
+  N              - max examples to evaluate (default: 20)
   FINQA_PARALLEL - concurrency degree (default: 32)
 """
 
@@ -24,32 +21,23 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
-import aiohttp
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agent_client import make_client
+from cost import CostCalculator
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-BASE_URL = os.environ.get("ORAGENT_URL", "http://localhost:32522")
 DATA_PATH = Path(__file__).resolve().parent / "data" / "dev.json"
-NUM_EXAMPLES = int(os.environ.get("FINQA_N", "20"))
+NUM_EXAMPLES = int(os.environ.get("N", "20"))
 PARALLELISM = int(os.environ.get("FINQA_PARALLEL", "32"))
 PREDICTIONS_DIR = Path(__file__).resolve().parent / "predictions"
 PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Relative tolerance for numeric comparison (1e-3 = 0.1 %)
 REL_TOL = 1e-3
 ABS_TOL = 1e-6
-
-# Pricing per million tokens (gpt-5-mini defaults, overridable)
-PRICE_INPUT = float(os.environ.get("PRICE_INPUT_PER_M", "0.25"))
-PRICE_CACHED = float(os.environ.get("PRICE_CACHED_PER_M", "0.025"))
-PRICE_OUTPUT = float(os.environ.get("PRICE_OUTPUT_PER_M", "2.00"))
-
-
-def calc_cost(inp: int, cached: int, out: int) -> float:
-    uncached = inp - cached
-    return (uncached * PRICE_INPUT + cached * PRICE_CACHED + out * PRICE_OUTPUT) / 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +46,6 @@ def calc_cost(inp: int, cached: int, out: int) -> float:
 
 
 def format_table(table: list[list[str]]) -> str:
-    """Render the table as a markdown-style table."""
     if not table:
         return ""
     header = table[0]
@@ -73,32 +60,27 @@ def format_table(table: list[list[str]]) -> str:
 
 
 def build_prompt(example: dict) -> str:
-    """Build a prompt from a FinQA example."""
     parts: list[str] = []
     parts.append(
         "You are given a financial report excerpt with text and a table. "
         "Answer the question with a single number (no units, no symbols, no words). "
         "If the answer is a percentage, express it as a decimal (e.g. 0.25 for 25%).\n"
     )
-
     pre = example.get("pre_text", [])
     if pre:
         parts.append("### Report text (before table)")
         parts.append(" ".join(pre))
         parts.append("")
-
     table = example.get("table", [])
     if table:
         parts.append("### Table")
         parts.append(format_table(table))
         parts.append("")
-
     post = example.get("post_text", [])
     if post:
         parts.append("### Report text (after table)")
         parts.append(" ".join(post))
         parts.append("")
-
     question = example["qa"]["question"]
     parts.append(f"Question: {question}")
     parts.append("")
@@ -112,7 +94,6 @@ def build_prompt(example: dict) -> str:
 
 
 def parse_number(text: str) -> float | None:
-    """Extract a number from the agent response."""
     text = text.strip()
     text = re.sub(r"```[^`]*```", "", text, flags=re.DOTALL)
     text = text.replace(",", "").replace("$", "").replace("%", "")
@@ -126,7 +107,6 @@ def parse_number(text: str) -> float | None:
 
 
 def answers_match(predicted: float, gold: float) -> bool:
-    """Check if predicted answer matches gold within tolerance."""
     if math.isclose(predicted, gold, rel_tol=REL_TOL, abs_tol=ABS_TOL):
         return True
     if abs(gold) < 10 and math.isclose(predicted, gold * 100, rel_tol=REL_TOL, abs_tol=ABS_TOL):
@@ -137,68 +117,51 @@ def answers_match(predicted: float, gold: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Async oragent API
-# ---------------------------------------------------------------------------
-
-
-async def query_agent(prompt: str, retries: int = 3) -> dict:
-    """Send a question to the agent and return the full response JSON."""
-    timeout = aiohttp.ClientTimeout(total=180)
-    for attempt in range(retries):
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as http:
-                async with http.post(f"{BASE_URL}/api/chat/session") as r:
-                    r.raise_for_status()
-                    data = await r.json()
-                    session_id = data["session_id"]
-                try:
-                    async with http.post(
-                        f"{BASE_URL}/api/chat/send-message",
-                        json={"session_id": session_id, "message": prompt},
-                    ) as r:
-                        r.raise_for_status()
-                        return await r.json()
-                finally:
-                    try:
-                        async with http.delete(f"{BASE_URL}/api/chat/session/{session_id}"):
-                            pass
-                    except Exception:
-                        pass
-        except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, asyncio.TimeoutError):
-            if attempt < retries - 1:
-                await asyncio.sleep(3)
-            else:
-                raise
-
-
-# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
 
+def query_agent(client, prompt: str) -> dict:
+    session_id = client.create_session()
+    try:
+        resp = client.send_message(session_id, prompt)
+        return {
+            "response": resp.response,
+            "usage": {
+                "input_tokens": resp.usage.input_tokens,
+                "cached_tokens": resp.usage.cached_tokens,
+                "output_tokens": resp.usage.output_tokens,
+            },
+            "model": resp.model,
+        }
+    finally:
+        client.delete_session(session_id)
+
+
 async def evaluate_one(
     sem: asyncio.Semaphore,
+    client,
     idx: int,
     total_count: int,
     ex: dict,
 ) -> dict:
-    """Evaluate a single example, respecting the semaphore for concurrency."""
     qid = ex["id"]
     gold_ans = ex["qa"]["exe_ans"]
     try:
         gold_float = float(gold_ans) if gold_ans is not None else None
     except (ValueError, TypeError):
-        gold_float = None  # non-numeric gold answer (e.g. "yes"/"no")
+        gold_float = None
     prompt = build_prompt(ex)
 
     async with sem:
         t0 = time.time()
-        resp_json = {}
+        resp_json: dict = {}
         raw_response = ""
-        usage = {}
+        usage: dict = {}
         model = "unknown"
         try:
-            resp_json = await query_agent(prompt)
+            loop = asyncio.get_event_loop()
+            resp_json = await loop.run_in_executor(None, query_agent, client, prompt)
             raw_response = resp_json.get("response", "")
             usage = resp_json.get("usage", {})
             model = resp_json.get("model", "unknown")
@@ -217,7 +180,8 @@ async def evaluate_one(
         match = answers_match(predicted, gold_float)
 
     status = "PASS" if match else "FAIL"
-    q_cost = calc_cost(q_input, q_cached, q_output)
+    cost_calc = CostCalculator(model)
+    q_cost = cost_calc.cost(q_input, q_cached, q_output)
     print(
         f"  [{idx+1}/{total_count}] {status}  predicted={predicted}  gold={gold_float}  "
         f"duration={elapsed:.1f}s  tokens={q_input}/{q_cached}/{q_output}  "
@@ -249,26 +213,25 @@ async def async_main():
         print("Run download_data.sh first.")
         sys.exit(1)
 
+    client = make_client()
+    mode = os.environ.get("AGENT_MODE", "local")
+
     print(f"Loading data from {DATA_PATH}")
     with open(DATA_PATH) as f:
         data = json.load(f)
 
     examples = data[:NUM_EXAMPLES]
     n = len(examples)
-    print(f"Evaluating {n} examples against {BASE_URL}  (parallelism={PARALLELISM})\n")
+    print(f"Evaluating {n} examples  mode={mode}  (parallelism={PARALLELISM})\n")
 
     sem = asyncio.Semaphore(PARALLELISM)
     wall_start = time.time()
 
-    tasks = [
-        evaluate_one(sem, i, n, ex)
-        for i, ex in enumerate(examples)
-    ]
+    tasks = [evaluate_one(sem, client, i, n, ex) for i, ex in enumerate(examples)]
     results = await asyncio.gather(*tasks)
 
     wall_elapsed = time.time() - wall_start
 
-    # Aggregate
     correct = sum(1 for r in results if r["correct"])
     total_tokens = {"input": 0, "cached": 0, "output": 0}
     sum_duration = 0.0
@@ -282,7 +245,8 @@ async def async_main():
             model_name = r["model"]
 
     accuracy = correct / n if n > 0 else 0.0
-    total_cost = calc_cost(total_tokens["input"], total_tokens["cached"], total_tokens["output"])
+    cost_calc = CostCalculator(model_name)
+    total_cost = cost_calc.cost(total_tokens["input"], total_tokens["cached"], total_tokens["output"])
 
     print("\n" + "=" * 70)
     print("EVALUATION RESULTS")
@@ -300,12 +264,11 @@ async def async_main():
     print(f"    Total:            {total_tokens['input']:>9}  {total_tokens['cached']:>9}  {total_tokens['output']:>9}")
     print(f"    Avg/question:     {total_tokens['input']//n:>9}  {total_tokens['cached']//n:>9}  {total_tokens['output']//n:>9}")
     print()
-    print(f"  Pricing (per 1M tokens):  input=${PRICE_INPUT}  cached=${PRICE_CACHED}  output=${PRICE_OUTPUT}")
+    print(f"  Pricing (per 1M tokens):  {cost_calc.format_pricing_line()}")
     print(f"  Total cost:         ${total_cost:.6f}")
     print(f"  Avg cost/question:  ${total_cost/n:.6f}")
     print("=" * 70)
 
-    # Save predictions
     out_path = PREDICTIONS_DIR / f"predictions_{int(time.time())}.json"
     summary = {
         "model": model_name,

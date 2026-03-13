@@ -1,24 +1,48 @@
 #!/usr/bin/env python3
-"""Evaluate oragent on HotpotQA dev distractor (first N examples)."""
+"""Evaluate agent on HotpotQA dev distractor (first N examples).
 
+Environment variables:
+  AGENT_MODE  - "local" (default) or "http"
+  ORAGENT_URL - oragent base URL when AGENT_MODE=http
+  N           - max examples to evaluate (default: 20)
+  PARALLELISM - concurrency degree (default: 32)
+"""
+
+import asyncio
 import json
 import os
 import re
 import sys
 import time
+from pathlib import Path
 
-import requests
+from dotenv import load_dotenv
 
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from agent_client import make_client
+from cost import CostCalculator
 from hotpot_evaluate_v1 import update_answer, update_sp
 
-BASE_URL = os.environ.get("ORAGENT_URL", "http://localhost:32522")
-DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "hotpot_dev_distractor_v1.json")
-NUM_EXAMPLES = int(os.environ.get("HOTPOTQA_N", "20"))
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DATA_PATH = Path(__file__).resolve().parent / "data" / "hotpot_dev_distractor_v1.json"
+NUM_EXAMPLES = int(os.environ.get("N", "20"))
+PARALLELISM = int(os.environ.get("PARALLELISM", "32"))
 
 
-def build_prompt(example):
-    """Build prompt with context paragraphs and question."""
-    lines = []
+# ---------------------------------------------------------------------------
+# Prompt building & parsing
+# ---------------------------------------------------------------------------
+
+
+def build_prompt(example: dict) -> str:
+    lines: list[str] = []
     lines.append("Given the following paragraphs, answer the question and identify the supporting facts.\n")
     for title, sentences in example["context"]:
         lines.append(f"### {title}")
@@ -26,19 +50,16 @@ def build_prompt(example):
             lines.append(f"[{i}] {sent}")
         lines.append("")
     lines.append(f"Question: {example['question']}\n")
-    lines.append('Respond with ONLY a JSON object (no markdown, no explanation):')
+    lines.append("Respond with ONLY a JSON object (no markdown, no explanation):")
     lines.append('{"answer": "<your answer>", "supporting_facts": [["<title>", <sentence_index>], ...]}')
     return "\n".join(lines)
 
 
-def parse_response(text):
-    """Extract JSON from agent response, handling markdown code blocks."""
-    # Try to find JSON in code blocks first
+def parse_response(text: str) -> tuple[str, list[list]]:
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         text = match.group(1)
     else:
-        # Try to find a JSON object directly
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             text = match.group(0)
@@ -46,7 +67,6 @@ def parse_response(text):
         data = json.loads(text)
         answer = str(data.get("answer", ""))
         sp = data.get("supporting_facts", [])
-        # Ensure sp is list of [str, int] pairs
         cleaned_sp = []
         for item in sp:
             if isinstance(item, (list, tuple)) and len(item) == 2:
@@ -56,72 +76,132 @@ def parse_response(text):
         return text.strip(), []
 
 
-def query_agent(prompt, retries=3):
-    """Send a question to the agent and get the response."""
-    for attempt in range(retries):
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+
+def query_agent(client, prompt: str) -> dict:
+    session_id = client.create_session()
+    try:
+        resp = client.send_message(session_id, prompt)
+        return {
+            "response": resp.response,
+            "usage": {
+                "input_tokens": resp.usage.input_tokens,
+                "cached_tokens": resp.usage.cached_tokens,
+                "output_tokens": resp.usage.output_tokens,
+            },
+            "model": resp.model,
+        }
+    finally:
+        client.delete_session(session_id)
+
+
+async def evaluate_one(
+    sem: asyncio.Semaphore,
+    client,
+    idx: int,
+    total: int,
+    ex: dict,
+) -> dict:
+    qid = ex["_id"]
+    prompt = build_prompt(ex)
+
+    async with sem:
+        t0 = time.time()
+        usage: dict = {}
+        model = "unknown"
         try:
-            # Create session
-            resp = requests.post(f"{BASE_URL}/api/chat/session", timeout=10)
-            resp.raise_for_status()
-            session_id = resp.json()["session_id"]
+            loop = asyncio.get_event_loop()
+            resp_json = await loop.run_in_executor(None, query_agent, client, prompt)
+            raw_response = resp_json.get("response", "")
+            usage = resp_json.get("usage", {})
+            model = resp_json.get("model", "unknown")
+            answer, sp = parse_response(raw_response)
+        except Exception as e:
+            print(f"  [{idx+1}/{total}] ERROR: {e}")
+            answer, sp = "", []
+        elapsed = time.time() - t0
 
-            try:
-                # Send message
-                resp = requests.post(
-                    f"{BASE_URL}/api/chat/send-message",
-                    json={"session_id": session_id, "message": prompt},
-                    timeout=120,
-                )
-                resp.raise_for_status()
-                return resp.json().get("response", resp.text)
-            finally:
-                # Clean up session
-                requests.delete(f"{BASE_URL}/api/chat/session/{session_id}", timeout=10)
-        except requests.exceptions.ConnectionError:
-            if attempt < retries - 1:
-                print(f"  Connection failed, retrying in 5s (attempt {attempt+1}/{retries})...")
-                time.sleep(5)
-            else:
-                raise
+    q_input = usage.get("input_tokens", 0)
+    q_cached = usage.get("cached_tokens", 0)
+    q_output = usage.get("output_tokens", 0)
+    cost_calc = CostCalculator(model)
+    q_cost = cost_calc.cost(q_input, q_cached, q_output)
+
+    print(
+        f"  [{idx+1}/{total}] {elapsed:.1f}s  answer={answer[:80]}  sp={len(sp)}  "
+        f"tokens={q_input}/{q_cached}/{q_output}  cost=${q_cost:.6f}  {ex['question'][:60]}"
+    )
+
+    return {
+        "qid": qid,
+        "answer": answer,
+        "sp": sp,
+        "gold": ex,
+        "duration_s": round(elapsed, 2),
+        "tokens": {"input": q_input, "cached": q_cached, "output": q_output},
+        "cost_usd": round(q_cost, 8),
+        "model": model,
+    }
 
 
-def main():
-    # Load dataset
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+async def async_main():
+    if not DATA_PATH.exists():
+        print(f"ERROR: Data not found at {DATA_PATH}")
+        sys.exit(1)
+
+    client = make_client()
+    mode = os.environ.get("AGENT_MODE", "local")
+
     print(f"Loading data from {DATA_PATH}")
     with open(DATA_PATH) as f:
         data = json.load(f)
 
     examples = data[:NUM_EXAMPLES]
-    print(f"Evaluating {len(examples)} examples against {BASE_URL}\n")
+    n = len(examples)
+    print(f"Evaluating {n} examples  mode={mode}  (parallelism={PARALLELISM})\n")
 
-    predictions = {"answer": {}, "sp": {}}
-    gold_list = []
+    sem = asyncio.Semaphore(PARALLELISM)
+    wall_start = time.time()
 
-    for i, ex in enumerate(examples):
-        qid = ex["_id"]
-        prompt = build_prompt(ex)
-        print(f"[{i+1}/{len(examples)}] {ex['question'][:80]}...")
+    tasks = [evaluate_one(sem, client, i, n, ex) for i, ex in enumerate(examples)]
+    results = await asyncio.gather(*tasks)
 
-        try:
-            raw_response = query_agent(prompt)
-            answer, sp = parse_response(raw_response)
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            answer, sp = "", []
+    wall_elapsed = time.time() - wall_start
 
-        predictions["answer"][qid] = answer
-        predictions["sp"][qid] = sp
-        gold_list.append(ex)
+    # Collect predictions & token stats
+    predictions: dict = {"answer": {}, "sp": {}}
+    gold_list: list[dict] = []
+    total_tokens = {"input": 0, "cached": 0, "output": 0}
+    model_name = "unknown"
+    for r in results:
+        predictions["answer"][r["qid"]] = r["answer"]
+        predictions["sp"][r["qid"]] = r["sp"]
+        gold_list.append(r["gold"])
+        total_tokens["input"] += r["tokens"]["input"]
+        total_tokens["cached"] += r["tokens"]["cached"]
+        total_tokens["output"] += r["tokens"]["output"]
+        if r["model"] != "unknown":
+            model_name = r["model"]
 
-        print(f"  Answer: {answer[:100]}")
-        print(f"  SP facts: {len(sp)}")
+    cost_calc = CostCalculator(model_name)
+    total_cost = cost_calc.cost(total_tokens["input"], total_tokens["cached"], total_tokens["output"])
 
     # Evaluate
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("EVALUATION RESULTS")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"  Model:              {model_name}")
+    print(f"  Wall clock:         {wall_elapsed:.1f}s  (parallelism={PARALLELISM})")
 
-    metrics = {
+    metrics: dict[str, float] = {
         "em": 0, "f1": 0, "prec": 0, "recall": 0,
         "sp_em": 0, "sp_f1": 0, "sp_prec": 0, "sp_recall": 0,
         "joint_em": 0, "joint_f1": 0, "joint_prec": 0, "joint_recall": 0,
@@ -160,9 +240,8 @@ def main():
             metrics["joint_prec"] += joint_prec
             metrics["joint_recall"] += joint_recall
 
-    N = len(gold_list)
     for k in metrics:
-        metrics[k] /= N
+        metrics[k] /= n
 
     print(f"\n{'Metric':<20} {'Score':>8}")
     print("-" * 30)
@@ -173,11 +252,24 @@ def main():
     print(f"{'Joint EM':<20} {metrics['joint_em']:>8.4f}")
     print(f"{'Joint F1':<20} {metrics['joint_f1']:>8.4f}")
 
-    # Save predictions for later analysis
-    pred_path = os.path.join(os.path.dirname(__file__), "predictions.json")
+    print()
+    print(f"  Token usage:        input      cached     output")
+    print(f"    Total:            {total_tokens['input']:>9}  {total_tokens['cached']:>9}  {total_tokens['output']:>9}")
+    print(f"    Avg/question:     {total_tokens['input']//n:>9}  {total_tokens['cached']//n:>9}  {total_tokens['output']//n:>9}")
+    print()
+    print(f"  Pricing (per 1M tokens):  {cost_calc.format_pricing_line()}")
+    print(f"  Total cost:         ${total_cost:.6f}")
+    print(f"  Avg cost/question:  ${total_cost/n:.6f}")
+    print("=" * 70)
+
+    pred_path = Path(__file__).resolve().parent / "predictions.json"
     with open(pred_path, "w") as f:
         json.dump(predictions, f, indent=2)
     print(f"\nPredictions saved to {pred_path}")
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

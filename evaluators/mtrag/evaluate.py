@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""MT-RAG Benchmark Evaluator for oragent.
+"""MT-RAG Benchmark Evaluator.
 
 Environment variables:
-  ORAGENT_URL      - oragent base URL (default: http://localhost:32522)
-  MTRAG_N          - max conversations, 0 = all (default: 0)
+  AGENT_MODE       - "local" (default) or "http"
+  ORAGENT_URL      - oragent base URL when AGENT_MODE=http
+  N                - max conversations, 0 = all (default: 0)
+  PARALLELISM      - concurrency degree (default: 32)
   MTRAG_COLLECTION - filter by domain/collection (default: all)
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -14,7 +17,15 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from agent_client import make_client
+from cost import CostCalculator
 
 from metrics import (
     token_f1,
@@ -27,8 +38,8 @@ from metrics import (
 # Config
 # ---------------------------------------------------------------------------
 
-ORAGENT_URL = os.environ.get("ORAGENT_URL", "http://localhost:32522")
-MTRAG_N = int(os.environ.get("MTRAG_N", "0"))
+NUM_CONVERSATIONS = int(os.environ.get("N", "0"))
+PARALLELISM = int(os.environ.get("PARALLELISM", "32"))
 MTRAG_COLLECTION = os.environ.get("MTRAG_COLLECTION", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -42,7 +53,6 @@ PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def find_data_files() -> list[Path]:
-    """Find the RAG generation task JSONL file."""
     rag_file = DATA_DIR / "human" / "generation_tasks" / "RAG.jsonl"
     if rag_file.exists():
         return [rag_file]
@@ -54,7 +64,6 @@ def find_data_files() -> list[Path]:
 
 
 def load_tasks(files: list[Path]) -> list[dict]:
-    """Load all tasks from JSONL files."""
     tasks = []
     for fpath in files:
         with open(fpath) as f:
@@ -71,43 +80,13 @@ def load_tasks(files: list[Path]) -> list[dict]:
 
 
 def group_conversations(tasks: list[dict]) -> dict[str, list[dict]]:
-    """Group tasks by conversation_id, sorted by turn number."""
-    convos = defaultdict(list)
+    convos: dict[str, list[dict]] = defaultdict(list)
     for task in tasks:
         cid = task.get("conversation_id", task.get("task_id", "unknown"))
         convos[cid].append(task)
-    # Sort each conversation by turn
     for cid in convos:
         convos[cid].sort(key=lambda t: t.get("turn", 0))
     return dict(convos)
-
-
-# ---------------------------------------------------------------------------
-# oragent API helpers
-# ---------------------------------------------------------------------------
-
-
-def create_session() -> str:
-    r = requests.post(f"{ORAGENT_URL}/api/chat/session")
-    r.raise_for_status()
-    return r.json()["session_id"]
-
-
-def send_message(session_id: str, message: str) -> dict:
-    r = requests.post(
-        f"{ORAGENT_URL}/api/chat/send-message",
-        json={"session_id": session_id, "message": message},
-        timeout=120,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def delete_session(session_id: str):
-    try:
-        requests.delete(f"{ORAGENT_URL}/api/chat/session/{session_id}", timeout=10)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +95,9 @@ def delete_session(session_id: str):
 
 
 def get_latest_user_message(input_data) -> str:
-    """Extract the latest user message from the task input."""
     if isinstance(input_data, str):
         return input_data
     if isinstance(input_data, list):
-        # Multi-turn: list of messages with speaker/text format
         for msg in reversed(input_data):
             if isinstance(msg, dict):
                 if msg.get("speaker") == "user":
@@ -133,25 +110,19 @@ def get_latest_user_message(input_data) -> str:
     return str(input_data)
 
 
-def build_prompt(user_text: str) -> str:
-    return user_text
-
-
 # ---------------------------------------------------------------------------
 # Gold relevant document IDs
 # ---------------------------------------------------------------------------
 
 
 def get_gold_relevant_ids(task: dict) -> set[str]:
-    """Extract IDs of relevant documents from task gold contexts."""
-    relevant = set()
+    relevant: set[str] = set()
     for ctx in task.get("contexts", []):
         feedback = ctx.get("feedback", {})
         if isinstance(feedback, dict) and feedback.get("relevant", "").lower() == "yes":
             doc_id = ctx.get("document_id", ctx.get("id", ""))
             if doc_id:
                 relevant.add(doc_id)
-    # If no feedback info, treat all contexts as relevant
     if not relevant:
         for ctx in task.get("contexts", []):
             doc_id = ctx.get("document_id", ctx.get("id", ""))
@@ -161,21 +132,27 @@ def get_gold_relevant_ids(task: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Run one conversation
+# Run one conversation (sequential turns, but conversations run in parallel)
 # ---------------------------------------------------------------------------
 
 
-def run_conversation(conversation_id: str, tasks: list[dict]) -> list[dict]:
-    session_id = create_session()
+def run_conversation(client, conversation_id: str, tasks: list[dict]) -> list[dict]:
+    session_id = client.create_session()
     predictions = []
     try:
         for task in tasks:
             user_text = get_latest_user_message(task.get("input", ""))
-            prompt = build_prompt(user_text)
+            resp = client.send_message(session_id, user_text)
 
-            response = send_message(session_id, prompt)
-            response_text = response.get("response", "")
-            contexts = response.get("contexts", [])
+            contexts_raw = [
+                {
+                    "document_id": c.document_id,
+                    "text": c.text,
+                    "title": c.title,
+                    "score": c.score,
+                }
+                for c in resp.contexts
+            ]
 
             prediction = {
                 "task_id": task.get("task_id", ""),
@@ -183,15 +160,44 @@ def run_conversation(conversation_id: str, tasks: list[dict]) -> list[dict]:
                 "collection": task.get("Collection", task.get("collection", "")),
                 "turn": task.get("turn", 0),
                 "input": task.get("input"),
-                "contexts": contexts,
-                "predictions": [{"text": response_text}],
+                "contexts": contexts_raw,
+                "predictions": [{"text": resp.response}],
                 "targets": task.get("targets", []),
                 "gold_contexts": task.get("contexts", []),
+                "tokens": {
+                    "input": resp.usage.input_tokens,
+                    "cached": resp.usage.cached_tokens,
+                    "output": resp.usage.output_tokens,
+                },
+                "model": resp.model,
             }
             predictions.append(prediction)
     finally:
-        delete_session(session_id)
+        client.delete_session(session_id)
     return predictions
+
+
+async def run_conversation_async(
+    sem: asyncio.Semaphore,
+    client,
+    idx: int,
+    total: int,
+    cid: str,
+    conv_tasks: list[dict],
+) -> list[dict]:
+    async with sem:
+        t0 = time.time()
+        try:
+            loop = asyncio.get_event_loop()
+            preds = await loop.run_in_executor(
+                None, run_conversation, client, cid, conv_tasks
+            )
+        except Exception as e:
+            print(f"    [{idx}/{total}] ERROR conversation {cid}: {e}")
+            return []
+        elapsed = time.time() - t0
+        print(f"    [{idx}/{total}] conversation {cid} ({len(conv_tasks)} turns) done in {elapsed:.1f}s")
+        return preds
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +213,6 @@ def evaluate_predictions(all_predictions: list[dict]):
 
     for pred in all_predictions:
         collection = pred.get("collection", "unknown")
-        # Generation metrics
         pred_text = pred["predictions"][0]["text"] if pred["predictions"] else ""
         targets = pred.get("targets", [])
         if targets:
@@ -221,7 +226,6 @@ def evaluate_predictions(all_predictions: list[dict]):
                 store["rouge_l"].append(rl)
                 store["exact_match"].append(em)
 
-        # Retrieval metrics
         retrieved_ids = [c.get("document_id", "") for c in pred.get("contexts", []) if c.get("document_id")]
         gold_pred = {"contexts": pred.get("gold_contexts", [])}
         gold_relevant = get_gold_relevant_ids(gold_pred)
@@ -272,8 +276,11 @@ def print_metrics(gen_all, gen_by_col, ret_all, ret_by_col):
 # ---------------------------------------------------------------------------
 
 
-def main():
-    print(f"MT-RAG Evaluator | url={ORAGENT_URL}")
+async def async_main():
+    client = make_client()
+    mode = os.environ.get("AGENT_MODE", "local")
+
+    print(f"MT-RAG Evaluator | mode={mode}  (parallelism={PARALLELISM})")
 
     if not DATA_DIR.exists():
         print(f"ERROR: Data not found at {DATA_DIR}")
@@ -295,34 +302,65 @@ def main():
 
     conversations = group_conversations(tasks)
     conv_ids = sorted(conversations.keys())
-    if MTRAG_N > 0:
-        conv_ids = conv_ids[:MTRAG_N]
-    print(f"Running {len(conv_ids)} conversation(s)...")
+    if NUM_CONVERSATIONS > 0:
+        conv_ids = conv_ids[:NUM_CONVERSATIONS]
+    print(f"Running {len(conv_ids)} conversation(s)...\n")
+
+    sem = asyncio.Semaphore(PARALLELISM)
+    wall_start = time.time()
+
+    coros = [
+        run_conversation_async(sem, client, i + 1, len(conv_ids), cid, conversations[cid])
+        for i, cid in enumerate(conv_ids)
+    ]
+    results = await asyncio.gather(*coros)
+
+    wall_elapsed = time.time() - wall_start
 
     all_predictions = []
-    for i, cid in enumerate(conv_ids, 1):
-        conv_tasks = conversations[cid]
-        print(f"  [{i}/{len(conv_ids)}] conversation {cid} ({len(conv_tasks)} turns)")
-        t0 = time.time()
-        try:
-            preds = run_conversation(cid, conv_tasks)
-            all_predictions.extend(preds)
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            continue
-        elapsed = time.time() - t0
-        print(f"    done in {elapsed:.1f}s")
+    for preds in results:
+        all_predictions.extend(preds)
 
-    # Save predictions
+    # Aggregate token usage
+    total_tokens = {"input": 0, "cached": 0, "output": 0}
+    model_name = "unknown"
+    for pred in all_predictions:
+        tokens = pred.get("tokens", {})
+        total_tokens["input"] += tokens.get("input", 0)
+        total_tokens["cached"] += tokens.get("cached", 0)
+        total_tokens["output"] += tokens.get("output", 0)
+        m = pred.get("model", "unknown")
+        if m != "unknown":
+            model_name = m
+
+    n_turns = len(all_predictions) or 1
+    cost_calc = CostCalculator(model_name)
+    total_cost = cost_calc.cost(total_tokens["input"], total_tokens["cached"], total_tokens["output"])
+
+    print(f"\n  Model:              {model_name}")
+    print(f"  Wall clock:         {wall_elapsed:.1f}s  (parallelism={PARALLELISM})")
+    print(f"  Turns evaluated:    {len(all_predictions)}")
+    print()
+    print(f"  Token usage:        input      cached     output")
+    print(f"    Total:            {total_tokens['input']:>9}  {total_tokens['cached']:>9}  {total_tokens['output']:>9}")
+    print(f"    Avg/turn:         {total_tokens['input']//n_turns:>9}  {total_tokens['cached']//n_turns:>9}  {total_tokens['output']//n_turns:>9}")
+    print()
+    print(f"  Pricing (per 1M tokens):  {cost_calc.format_pricing_line()}")
+    print(f"  Total cost:         ${total_cost:.6f}")
+    print(f"  Avg cost/turn:      ${total_cost/n_turns:.6f}")
+
     out_path = PREDICTIONS_DIR / f"predictions_{int(time.time())}.jsonl"
     with open(out_path, "w") as f:
         for pred in all_predictions:
             f.write(json.dumps(pred) + "\n")
     print(f"\nPredictions saved to {out_path}")
 
-    # Evaluate
     gen_all, gen_by_col, ret_all, ret_by_col = evaluate_predictions(all_predictions)
     print_metrics(gen_all, gen_by_col, ret_all, ret_by_col)
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
