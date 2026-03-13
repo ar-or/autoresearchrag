@@ -14,6 +14,7 @@ Environment variables:
   ES_INDEX      - Index name (default: mtrag)
   CHUNK_SIZE    - Characters per chunk (default: 512)
   CHUNK_OVERLAP - Overlap between chunks (default: 64)
+  EMBED_CACHE   - Path to embedding cache db (default: .embed_cache.db)
 """
 
 import hashlib
@@ -21,21 +22,22 @@ import json
 import os
 import re
 import sys
-import uuid
 from pathlib import Path
-from textwrap import dedent
 
 import requests
-from openai import OpenAI
+
+from scripts.embedder import embed_batch, embed_batch_api, EMBED_DIMS, EMBED_MODEL
+from scripts.embed_cache import get as cache_get, put as cache_put, put_many as cache_put_many, flush as cache_flush
 
 ELASTIC_URL = os.environ.get("ELASTIC_URL", "http://localhost:9200")
 ELASTIC_INDEX = os.environ.get("ES_INDEX", "mtrag")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "64"))
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIMS = 1536
 
-openai = OpenAI()
+
+# ---------------------------------------------------------------------------
+# Elasticsearch index
+# ---------------------------------------------------------------------------
 
 
 def ensure_index():
@@ -48,11 +50,12 @@ def ensure_index():
                 "title": {"type": "text"},
                 "source": {"type": "keyword"},
                 "document_id": {"type": "keyword"},
+                "doc_name": {"type": "keyword"},
+                "collection_name": {"type": "keyword"},
                 "chunk_index": {"type": "integer"},
             }
         }
     }
-    # Check if index exists
     r = requests.head(f"{ELASTIC_URL}/{ELASTIC_INDEX}")
     if r.status_code == 404:
         r = requests.put(f"{ELASTIC_URL}/{ELASTIC_INDEX}", json=mapping)
@@ -60,16 +63,19 @@ def ensure_index():
         print(f"Created index '{ELASTIC_INDEX}'")
         return
 
-    # Index exists — check if it has the embedding field
     r = requests.get(f"{ELASTIC_URL}/{ELASTIC_INDEX}/_mapping")
     r.raise_for_status()
     props = r.json().get(ELASTIC_INDEX, {}).get("mappings", {}).get("properties", {})
     if "embedding" not in props:
-        # Delete and recreate with proper mapping
         requests.delete(f"{ELASTIC_URL}/{ELASTIC_INDEX}")
         r = requests.put(f"{ELASTIC_URL}/{ELASTIC_INDEX}", json=mapping)
         r.raise_for_status()
         print(f"Recreated index '{ELASTIC_INDEX}' with dense_vector mapping")
+
+
+# ---------------------------------------------------------------------------
+# Fetching / reading
+# ---------------------------------------------------------------------------
 
 
 def fetch_url(url: str) -> tuple[str, str]:
@@ -77,10 +83,8 @@ def fetch_url(url: str) -> tuple[str, str]:
     r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     html = r.text
-    # Extract title
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     title = title_match.group(1).strip() if title_match else url
-    # Strip HTML tags for plain text
     text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -96,6 +100,11 @@ def read_file(path: str) -> tuple[str, str]:
     return title, text
 
 
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     """Split text into overlapping chunks."""
     chunks = []
@@ -109,23 +118,39 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return chunks
 
 
-def embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of texts."""
-    resp = openai.embeddings.create(input=texts, model=EMBED_MODEL)
-    return [d.embedding for d in resp.data]
+# ---------------------------------------------------------------------------
+# Indexing
+# ---------------------------------------------------------------------------
 
 
-def index_chunks(chunks: list[str], title: str, source: str, doc_id: str):
-    """Index chunks into Elasticsearch."""
-    # Embed in batches of 100
+def index_chunks(
+    chunks: list[str], title: str, source: str, doc_id: str,
+    doc_name: str = "", collection_name: str = "",
+):
+    """Index chunks into Elasticsearch (embeds via realtime API)."""
     all_embeddings = []
     for i in range(0, len(chunks), 100):
         batch = chunks[i : i + 100]
         all_embeddings.extend(embed_batch(batch))
 
-    # Bulk index
+    return _index_with_embeddings(chunks, all_embeddings, title, source, doc_id, doc_name, collection_name)
+
+
+def index_chunks_preembedded(
+    chunks: list[str], embeddings: list[list[float]], title: str, source: str, doc_id: str,
+    doc_name: str = "", collection_name: str = "",
+):
+    """Index chunks into Elasticsearch with pre-computed embeddings."""
+    return _index_with_embeddings(chunks, embeddings, title, source, doc_id, doc_name, collection_name)
+
+
+def _index_with_embeddings(
+    chunks: list[str], embeddings: list[list[float]], title: str, source: str, doc_id: str,
+    doc_name: str = "", collection_name: str = "",
+):
+    """Bulk-index chunks with their embeddings into Elasticsearch."""
     bulk_body = []
-    for i, (chunk, emb) in enumerate(zip(chunks, all_embeddings)):
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
         chunk_id = f"{doc_id}_{i}"
         bulk_body.append(json.dumps({"index": {"_index": ELASTIC_INDEX, "_id": chunk_id}}))
         bulk_body.append(
@@ -135,6 +160,8 @@ def index_chunks(chunks: list[str], title: str, source: str, doc_id: str):
                     "title": title,
                     "source": source,
                     "document_id": doc_id,
+                    "doc_name": doc_name,
+                    "collection_name": collection_name,
                     "chunk_index": i,
                     "embedding": emb,
                 }
@@ -152,7 +179,12 @@ def index_chunks(chunks: list[str], title: str, source: str, doc_id: str):
     return len(chunks) - errors, errors
 
 
-def ingest(source: str):
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def ingest(source: str, doc_name: str = "", collection_name: str = ""):
     """Ingest a single URL or file."""
     is_url = source.startswith("http://") or source.startswith("https://")
     print(f"\n{'URL' if is_url else 'File'}: {source}")
@@ -163,12 +195,14 @@ def ingest(source: str):
         title, text = read_file(source)
 
     doc_id = hashlib.sha256(source.encode()).hexdigest()[:16]
+    if not doc_name:
+        doc_name = title
     chunks = chunk_text(text)
     print(f"  Title: {title}")
     print(f"  Text length: {len(text)} chars")
     print(f"  Chunks: {len(chunks)}")
 
-    ok, errs = index_chunks(chunks, title, source, doc_id)
+    ok, errs = index_chunks(chunks, title, source, doc_id, doc_name, collection_name)
     print(f"  Indexed: {ok} chunks ({errs} errors)")
     return ok
 

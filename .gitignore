@@ -55,6 +55,12 @@ out/
 coverage/
 .nyc_output/
 
+# SQLite runtime files
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
 # Evaluator data and predictions
 evaluators/*/data/
 evaluators/*/predictions/

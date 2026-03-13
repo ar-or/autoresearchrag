@@ -95,7 +95,8 @@ def main():
         if not chunks:
             continue
 
-        ok, errs = index_chunks(chunks, title, f"finqa:{filename}", doc_id.replace("/", "_"))
+        ok, errs = index_chunks(chunks, title, f"finqa:{filename}", doc_id.replace("/", "_"),
+                                 doc_name=filename, collection_name="mycollection1")
         total_chunks += ok
         total_errors += errs
 
