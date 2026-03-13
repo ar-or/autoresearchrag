@@ -1,6 +1,6 @@
 status=initialized
 hypothesis_name=baseline_develop
-git_commit=ca085bc9afa5233aaec3c6d3d6fd23545bdd2f92
+git_commit=a8f8edafe7c185697a4c5beb9e3be8ed286c0710
 time=2026-03-13T12:30:17Z
 elastic_index=mtrag
 finqa_n=30
