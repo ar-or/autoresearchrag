@@ -1,10 +1,10 @@
-status=uninitialized
-hypothesis_name=
-git_commit=
-time=
-elastic_index=
+status=initialized
+hypothesis_name=baseline_develop
+git_commit=ca085bc9afa5233aaec3c6d3d6fd23545bdd2f92
+time=2026-03-13T12:30:17Z
+elastic_index=mtrag
 finqa_n=30
-finqa_accuracy=
-finqa_correct=
-finqa_total_cost_usd=
-notes=Initialize from the first accepted N=30 FinQA run on develop.
+finqa_accuracy=0.8000
+finqa_correct=24
+finqa_total_cost_usd=0.054682
+notes=Initialized champion from the first accepted N=30 FinQA run on develop. Artifact: artifacts/baseline_develop/predictions_1773405003.json
