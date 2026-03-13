@@ -12,9 +12,16 @@ function toLC(messages: ChatMessage[]) {
   );
 }
 
+export interface TokenUsage {
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+}
+
 export interface AgentResult {
   content: string;
   contexts: RetrievedContext[];
+  usage: TokenUsage;
 }
 
 export async function runAgent(
@@ -81,8 +88,19 @@ export async function runAgent(
       }
     }
 
+    // Accumulate token usage from all AI messages
+    const usage: TokenUsage = { input_tokens: 0, cached_tokens: 0, output_tokens: 0 };
     let content: string;
     if (result?.messages && Array.isArray(result.messages)) {
+      for (const msg of result.messages) {
+        // LangChain stores usage in usage_metadata (snake_case) and response_metadata.tokenUsage (camelCase)
+        const um = msg?.usage_metadata ?? msg?.kwargs?.usage_metadata;
+        if (um) {
+          usage.input_tokens += um.input_tokens ?? 0;
+          usage.output_tokens += um.output_tokens ?? 0;
+          usage.cached_tokens += um.input_token_details?.cache_read ?? 0;
+        }
+      }
       const lastAI = [...result.messages].reverse().find(
         (m: any) => m?.constructor?.name === "AIMessage" || m?.kwargs?.type === "ai" || m?.type === "ai",
       );
@@ -93,7 +111,7 @@ export async function runAgent(
       content = result?.content ?? result?.output ?? JSON.stringify(result);
     }
 
-    return { content, contexts: [...contexts, ...additionalContexts] };
+    return { content, contexts: [...contexts, ...additionalContexts], usage };
   } finally {
     await langfuseHandler.shutdownAsync?.().catch(() => {});
   }

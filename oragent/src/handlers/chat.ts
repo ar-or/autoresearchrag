@@ -1,5 +1,6 @@
 import { sessionStore } from "../sessions/store";
 import { runAgent } from "../agent/agent";
+import { settings } from "../settings";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -61,5 +62,11 @@ export async function sendMessage(req: Request): Promise<Response> {
     contexts: result.contexts,
   });
 
-  return json({ session_id, response: result.content, contexts: result.contexts });
+  return json({
+    session_id,
+    response: result.content,
+    contexts: result.contexts,
+    model: settings.model,
+    usage: result.usage,
+  });
 }

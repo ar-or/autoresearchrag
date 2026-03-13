@@ -14,6 +14,10 @@ build/
 # Environment variables
 .env
 
+# SSH keys
+github_deploy_key
+github_deploy_key.pub
+
 # IDE
 .idea/
 .vscode/

@@ -1,0 +1,8 @@
+.env
+.git
+.venv
+node_modules
+oragent/node_modules
+github_deploy_key
+github_deploy_key.pub
+evaluators/*/predictions/
