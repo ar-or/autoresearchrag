@@ -1,10 +1,10 @@
 status=initialized
-hypothesis_name=h01_hybrid_vector_text
-git_commit=c3b35220dc73f9dbf1e4daa720ea567db630a5d3
-time=2026-03-16T08:32:08Z
+hypothesis_name=baseline_reindexed_develop
+git_commit=065bb8f8d1ae2725c8f6c149b05f4e5aa1b1744b
+time=2026-03-16T08:49:43Z
 elastic_index=mtrag
 finqa_n=30
-finqa_accuracy=0.8667
-finqa_correct=26
-finqa_total_cost_usd=0.056340
-notes=hypothesis id=H01; changed files=agent.py; reingest=no; summary=combined vector and text retrieval with reciprocal-rank fusion before final top-k selection; final judge decision=promoted
+finqa_accuracy=0.8333
+finqa_correct=25
+finqa_total_cost_usd=0.058086
+notes=hypothesis id=baseline_reindexed; changed files=agent.py|evaluators/agent_client.py|evaluators/finqa/evaluate.py; reingest=yes; summary=reinitialized the local FinQA index on mtrag and re-established a valid live-retrieval baseline on develop after timeout hardening; final judge decision=promoted
