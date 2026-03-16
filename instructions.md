@@ -41,6 +41,7 @@ Sub-Agent Mission
 - Execute exactly one hypothesis.
 - Implement the hypothesis.
 - Evaluate it on FinQA with `N=30`.
+- If the FinQA result ties the current champion on accuracy, run HotpotQA with `N=30` as the tiebreaker.
 - Judge it against the current champion in `best_result.txt`.
 - Record the result in `results.csv`.
 - If the hypothesis wins, update `best_result.txt` and merge the code into `develop`.
@@ -82,8 +83,10 @@ Ingestion Rules
 
 Evaluation Protocol
 1. Run exactly one FinQA evaluation with `N=30`.
-2. Do not run MT-RAG, HotpotQA, or any other evaluator unless the planner explicitly asked for it.
-3. Save the FinQA output artifact under `artifacts/<hypothesis_slug>/` and record the artifact path in `results.csv`.
+2. If the FinQA run ties the current champion on accuracy, run exactly one HotpotQA evaluation with `N=30` as a tiebreaker.
+3. Do not run MT-RAG or any other evaluator unless the planner explicitly asked for it.
+4. Save the FinQA output artifact under `artifacts/<hypothesis_slug>/` and record the artifact path in `results.csv`.
+5. If HotpotQA was used as a tiebreaker, save that artifact under `artifacts/<hypothesis_slug>/` and record the HotpotQA metrics and artifact path in `results.csv`.
 
 Recording Rules
 1. Append one row to `results.csv` for every evaluated hypothesis, including rejected runs.
@@ -103,8 +106,21 @@ Recording Rules
    - token and cost columns
    - `finqa_artifact_path`
    - `notes`
-3. Leave unrelated benchmark columns blank if they were not run.
-4. In `notes`, include:
+3. If HotpotQA ran, also record:
+   - `hotpot_n`
+   - `hotpot_parallelism`
+   - `hotpot_ok`
+   - `hotpot_answer_em`
+   - `hotpot_answer_f1`
+   - `hotpot_sp_em`
+   - `hotpot_sp_f1`
+   - `hotpot_joint_em`
+   - `hotpot_joint_f1`
+   - `hotpot_wall_clock_s`
+   - token and cost columns
+   - `hotpot_artifact_path`
+4. Leave unrelated benchmark columns blank if they were not run.
+5. In `notes`, include:
    - hypothesis id
    - changed files
    - `reingest=yes` or `reingest=no`
@@ -121,8 +137,9 @@ Judge Rules
    - the result is worse than the champion
    - the change cannot be attributed to a single hypothesis
    - cost or latency increased materially without meaningful accuracy gain
-4. Treat ties as rejections.
-5. Promote if the challenger is better than the champion on the single `N=30` run and the win is explainable:
+4. If FinQA ties the current champion on accuracy, use the HotpotQA `N=30` tiebreak result to decide the winner.
+5. Treat ties after the HotpotQA tiebreak as rejections.
+6. Promote if the challenger is better than the champion on the required evaluation runs and the win is explainable:
    - the result is explainable from the hypothesis
    - the cost increase is acceptable for the gain
 
@@ -138,6 +155,7 @@ Merge Rules
 Champion File
 - `best_result.txt` is the single source of truth for the current champion.
 - `best_result.txt` must include the champion's `elastic_index`, and that value is the default `ES_INDEX` baseline for the next experiment.
+- If HotpotQA was used to break a tie for the champion, `best_result.txt` must also include the recorded HotpotQA metrics for that champion.
 - If `best_result.txt` is uninitialized, the first successful `N=30` FinQA run accepted on `develop` becomes the initial champion.
 
 Cleanup
