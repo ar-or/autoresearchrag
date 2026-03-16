@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -214,6 +216,55 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    a_norm = math.sqrt(sum(x * x for x in a))
+    b_norm = math.sqrt(sum(y * y for y in b))
+    if not a_norm or not b_norm:
+        return 0.0
+    return dot / (a_norm * b_norm)
+
+
+async def _sentence_rerank_contexts(
+    query: str,
+    contexts: list[RetrievedContext],
+    top_k: int,
+) -> list[RetrievedContext]:
+    if not contexts:
+        return contexts
+
+    query_vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+    sentence_texts: list[str] = []
+    sentence_to_context: list[int] = []
+    for index, context in enumerate(contexts):
+        for sentence in _split_sentences(context.text)[:6]:
+            sentence_texts.append(sentence)
+            sentence_to_context.append(index)
+    if not sentence_texts:
+        return contexts[:top_k]
+
+    sentence_vectors = await asyncio.to_thread(embed_batch, sentence_texts)
+    best_scores = [-1.0] * len(contexts)
+    for idx, vector in enumerate(sentence_vectors):
+        context_index = sentence_to_context[idx]
+        best_scores[context_index] = max(
+            best_scores[context_index],
+            _cosine_similarity(query_vector, vector),
+        )
+
+    ranked = sorted(
+        enumerate(contexts),
+        key=lambda item: (best_scores[item[0]], item[1].score),
+        reverse=True,
+    )
+    return [context for _, context in ranked[:top_k]]
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -232,7 +283,11 @@ async def retrieve(
             hits = _es_text_search(idx, query, top_k)
         except Exception:
             return []
-    return _hits_to_contexts(hits)
+    contexts = _hits_to_contexts(hits)
+    try:
+        return await _sentence_rerank_contexts(query, contexts, top_k)
+    except Exception:
+        return contexts[:top_k]
 
 
 # ---------------------------------------------------------------------------
