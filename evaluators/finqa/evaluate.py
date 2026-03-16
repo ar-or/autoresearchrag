@@ -33,6 +33,8 @@ from cost import CostCalculator
 DATA_PATH = Path(__file__).resolve().parent / "data" / "dev.json"
 NUM_EXAMPLES = int(os.environ.get("N", "20"))
 PARALLELISM = int(os.environ.get("FINQA_PARALLEL", "32"))
+EXAMPLE_TIMEOUT_S = float(os.environ.get("FINQA_EXAMPLE_TIMEOUT_S", "900"))
+MAX_RETRIES = int(os.environ.get("FINQA_MAX_RETRIES", "2"))
 PREDICTIONS_DIR = Path(__file__).resolve().parent / "predictions"
 PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -159,15 +161,28 @@ async def evaluate_one(
         raw_response = ""
         usage: dict = {}
         model = "unknown"
-        try:
-            loop = asyncio.get_event_loop()
-            resp_json = await loop.run_in_executor(None, query_agent, client, prompt)
-            raw_response = resp_json.get("response", "")
-            usage = resp_json.get("usage", {})
-            model = resp_json.get("model", "unknown")
-        except Exception as e:
-            raw_response = ""
-            print(f"  [{idx+1}/{total_count}] ERROR: {e}")
+        loop = asyncio.get_event_loop()
+        for attempt in range(1, MAX_RETRIES + 2):
+            try:
+                resp_json = await loop.run_in_executor(None, query_agent, client, prompt)
+                raw_response = resp_json.get("response", "")
+                usage = resp_json.get("usage", {})
+                model = resp_json.get("model", "unknown")
+                break
+            except TimeoutError as e:
+                raw_response = ""
+                print(
+                    f"  [{idx+1}/{total_count}] TIMEOUT attempt={attempt}/{MAX_RETRIES + 1}: {e}"
+                )
+                if attempt == MAX_RETRIES + 1:
+                    break
+            except Exception as e:
+                raw_response = ""
+                print(
+                    f"  [{idx+1}/{total_count}] ERROR attempt={attempt}/{MAX_RETRIES + 1}: {e}"
+                )
+                if attempt == MAX_RETRIES + 1:
+                    break
         elapsed = time.time() - t0
 
     q_input = usage.get("input_tokens", 0)
@@ -213,6 +228,7 @@ async def async_main():
         print("Run download_data.sh first.")
         sys.exit(1)
 
+    os.environ.setdefault("LOCAL_AGENT_TIMEOUT_S", str(EXAMPLE_TIMEOUT_S))
     client = make_client()
     mode = os.environ.get("AGENT_MODE", "local")
 

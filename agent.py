@@ -31,9 +31,11 @@ ELASTIC_URL: str = os.environ.get("ELASTIC_URL", "http://localhost:9200")
 ELASTIC_API_KEY: str = os.environ.get("ELASTIC_API_KEY", "")
 ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
+ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
+OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
 EMBED_MODEL: str = "text-embedding-3-small"
 
-_openai = AsyncOpenAI()
+_openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
 
 # ---------------------------------------------------------------------------
 # Types
@@ -137,7 +139,10 @@ def _es_vector_search(
         "_source": {"excludes": ["embedding"]},
     }
     r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search", headers=_es_headers(), json=body
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json=body,
+        timeout=ELASTIC_TIMEOUT_S,
     )
     if not r.ok:
         return _es_text_search(index, "", k)
@@ -156,6 +161,7 @@ def _es_text_search(
         f"{ELASTIC_URL}/{index}/_search",
         headers=_es_headers(),
         json={"size": k, "query": q},
+        timeout=ELASTIC_TIMEOUT_S,
     )
     if not r.ok:
         return []

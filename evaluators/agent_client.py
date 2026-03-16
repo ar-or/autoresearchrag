@@ -16,6 +16,7 @@ from typing import Any
 # Ensure project root is importable for the local agent
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
+LOCAL_AGENT_TIMEOUT_S = float(os.environ.get("LOCAL_AGENT_TIMEOUT_S", "900"))
 
 
 # ---------------------------------------------------------------------------
@@ -146,9 +147,20 @@ class LocalAgentClient(AgentClient):
             import concurrent.futures
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = pool.submit(asyncio.run, self._agent.send_message(session_id, message)).result()
+                result = pool.submit(
+                    asyncio.run,
+                    asyncio.wait_for(
+                        self._agent.send_message(session_id, message),
+                        timeout=LOCAL_AGENT_TIMEOUT_S,
+                    ),
+                ).result(timeout=LOCAL_AGENT_TIMEOUT_S + 5)
         else:
-            result = asyncio.run(self._agent.send_message(session_id, message))
+            result = asyncio.run(
+                asyncio.wait_for(
+                    self._agent.send_message(session_id, message),
+                    timeout=LOCAL_AGENT_TIMEOUT_S,
+                )
+            )
 
         return AgentResponse(
             session_id=result.session_id,
