@@ -1,10 +1,10 @@
 status=initialized
-hypothesis_name=baseline_develop
-git_commit=a8f8edafe7c185697a4c5beb9e3be8ed286c0710
-time=2026-03-13T12:30:17Z
+hypothesis_name=h01_hybrid_vector_text
+git_commit=c3b35220dc73f9dbf1e4daa720ea567db630a5d3
+time=2026-03-16T08:32:08Z
 elastic_index=mtrag
 finqa_n=30
-finqa_accuracy=0.8000
-finqa_correct=24
-finqa_total_cost_usd=0.054682
-notes=hypothesis id=baseline; changed files=pyproject.toml|uv.lock; reingest=no; summary=initialized reproducible baseline evaluation on develop after fixing missing runtime dependencies; final judge decision=promoted
+finqa_accuracy=0.8667
+finqa_correct=26
+finqa_total_cost_usd=0.056340
+notes=hypothesis id=H01; changed files=agent.py; reingest=no; summary=combined vector and text retrieval with reciprocal-rank fusion before final top-k selection; final judge decision=promoted
