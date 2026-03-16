@@ -65,3 +65,6 @@ coverage/
 # Evaluator data and predictions
 evaluators/*/data/
 evaluators/*/predictions/
+
+# Local git worktrees used for isolated experiments
+.worktrees/
