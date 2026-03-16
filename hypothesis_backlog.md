@@ -11,17 +11,6 @@ Card schema
 - `main risk`: how it can fail
 - `judge focus`: what the judge should look at beyond raw accuracy
 
-## Summary
-
-| id | name |
-| --- | --- |
-| H01 | Hybrid Vector + Text Retrieval |
-| H02 | Document-Diversified Top-K |
-| H03 | Table-Preserving FinQA Ingestion |
-| H04 | Structure-Aware Chunk Boundaries |
-| H05 | Adaptive Retrieval for Numeric Queries |
-| H06 | Neighbor Chunk Expansion |
-| H07 | Context Packing and Dedup |
 
 ## H01: Hybrid Vector + Text Retrieval
 
@@ -158,3 +147,891 @@ Main risk
 
 Judge focus
 - Check prompt token counts and accuracy together. A small accuracy gain with lower cost is still a good outcome here.
+
+## Research-Sourced Additions
+
+### DRAG and Retrieval-Control Papers
+
+## H08: Retrieval Debate Reranking
+
+Hypothesis
+- Running a lightweight proponent-versus-opponent debate over the first retrieval pool will demote misleading chunks and improve evidence quality on ambiguity-heavy questions.
+
+Implementation sketch
+- Retrieve a wider candidate pool, then ask one pass to argue which chunks support the task and another to challenge weak or misleading chunks.
+- Use the resulting debate notes as a reranking signal before final context packing.
+- Paper: [Removal of Hallucination on Hallucination: Debate-Augmented RAG](https://arxiv.org/abs/2505.18581)
+
+Expected upside
+- This directly targets "hallucination on hallucination" by stress-testing evidence before it reaches the answer step.
+
+Main risk
+- Extra reasoning may add latency and amplify prompt noise if the debate itself is low quality.
+
+Judge focus
+- Check whether retrieval precision improves enough to justify the extra call budget.
+
+## H09: Judge-Based Evidence Selection
+
+Hypothesis
+- A separate judge pass that selects only the most defensible retrieved chunks will outperform naive top-`k` truncation when retrieval quality is uneven.
+
+Implementation sketch
+- After initial retrieval, ask a judge prompt to keep only chunks that are both relevant and mutually consistent.
+- Use the judge output as a filter rather than as a new answer generator.
+- Paper: [Removal of Hallucination on Hallucination: Debate-Augmented RAG](https://arxiv.org/abs/2505.18581)
+
+Expected upside
+- A dedicated selection step may cut contradictory or off-topic chunks before they contaminate the answer prompt.
+
+Main risk
+- Over-filtering can drop the one chunk that contains the decisive number or entity mention.
+
+Judge focus
+- Look for better factual grounding without a large recall collapse.
+
+## H10: Asymmetric Generation Debate
+
+Hypothesis
+- Splitting generation into asymmetric roles, where one pass answers from current evidence and another explicitly looks for failure cases, will reduce overconfident wrong answers.
+
+Implementation sketch
+- Keep the normal answer draft, but add a challenger pass that only searches for contradictions, missing assumptions, or unsupported claims in that draft.
+- Resolve with a short final synthesis prompt that can revise or abstain.
+- Paper: [Removal of Hallucination on Hallucination: Debate-Augmented RAG](https://arxiv.org/abs/2505.18581)
+
+Expected upside
+- This may improve answer faithfulness even when retrieval is only partially correct.
+
+Main risk
+- The challenge pass can become generic and add cost without finding real errors.
+
+Judge focus
+- Inspect whether wrong answers become more cautious or better cited rather than merely longer.
+
+### Query Performance Prediction
+
+## H11: QPP-Gated Evidence Acceptance
+
+Hypothesis
+- Estimating retrieval quality before injecting retrieved context into the reasoning chain will reduce bad iterations in agentic RAG.
+
+Implementation sketch
+- Compute a post-retrieval QPP score for each generated sub-query.
+- If the score is low, either retry with a rewritten query, switch retriever settings, or skip context injection for that iteration.
+- Paper: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S3.SS3)
+
+Expected upside
+- The paper's core claim is that query quality correlates with answer quality, so filtering low-value retrievals may shorten harmful loops.
+
+Main risk
+- A conservative gate can suppress retrieval exactly when the model needs it most.
+
+Judge focus
+- Compare both accuracy and average iterations, not accuracy alone.
+
+## H12: NQC Score Dispersion
+
+Hypothesis
+- Normalized query commitment (NQC) can serve as a cheap retrieval-confidence signal for deciding whether a generated sub-query is worth trusting.
+
+Implementation sketch
+- Compute NQC from the top retrieval score distribution for each generated query.
+- Use the score to trigger a retry, fallback, or retrieval abstention threshold.
+- Paper: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S4.SS3)
+
+Expected upside
+- NQC is cheap and retriever-agnostic enough to test without redesigning the stack.
+
+Main risk
+- Score dispersion can be unstable across retrievers and index settings.
+
+Judge focus
+- Verify that the threshold transfers across question types instead of only helping a narrow slice.
+
+## H13: Max-Score Retrieval Gate
+
+Hypothesis
+- For neural retrieval setups, the top document score alone may be a sufficiently strong gate for accepting or retrying a generated sub-query.
+
+Implementation sketch
+- Record the highest retrieval score for each sub-query.
+- If it falls below a tuned threshold, rewrite or skip the retrieval result for that step.
+- Paper: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S4.SS3)
+
+Expected upside
+- This is simpler than full score-distribution methods and easy to deploy in fast loops.
+
+Main risk
+- One strong but wrong lexical hit can produce false confidence.
+
+Judge focus
+- Check whether the simplicity win survives on multi-hop and compositional questions.
+
+## H14: A-Pair-Ratio Coherence Gate
+
+Hypothesis
+- Measuring whether top retrieved documents are semantically more coherent than tail documents can identify good versus noisy dense-retrieval results.
+
+Implementation sketch
+- For dense retrieval only, compute the A-Pair-Ratio coherence score over the retrieved set.
+- Use it as a gate for whether to trust the current retrieval result or ask for a reformulated query.
+- Paper: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S4.SS3)
+
+Expected upside
+- Coherence is closer to "useful evidence cluster" than raw top-score confidence.
+
+Main risk
+- A coherent cluster of irrelevant documents can still pass the gate.
+
+Judge focus
+- Inspect failure cases where coherent but off-target evidence slips through.
+
+## H15: Dense-QPP Geometry Gate
+
+Hypothesis
+- The geometric spread of query-plus-document embeddings can flag weak dense-retrieval results before they pollute the reasoning trace.
+
+Implementation sketch
+- Compute the Dense-QPP hypercube-style geometry score over the query and top dense hits.
+- Use it to choose between accepting the result, broadening retrieval, or reformulating the query.
+- Paper: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S4.SS3)
+
+Expected upside
+- This may catch cases where the retrieved set is too diffuse to support a precise answer.
+
+Main risk
+- The signal depends on embedding-space behavior and may be brittle with the current encoder.
+
+Judge focus
+- Require gains that hold across multiple question forms, not just entity lookup.
+
+### Reasoning-Augmented Retrieval
+
+## H16: Few-Shot Chain-of-Thought
+
+Hypothesis
+- Adding explicit few-shot chain-of-thought demonstrations before answer generation will help the model use retrieved evidence more faithfully on multi-step questions.
+
+Implementation sketch
+- Keep retrieval unchanged and only add concise reasoning exemplars that show evidence-grounded intermediate steps.
+- Use short demonstrations to avoid crowding out retrieved context.
+- Paper: [Chain-of-Thought Prompting Elicits Reasoning in Large Language Models](https://arxiv.org/abs/2201.11903)
+
+Expected upside
+- Better intermediate reasoning can increase the value extracted from the same retrieved evidence.
+
+Main risk
+- Long exemplars may steal tokens from evidence and hurt rather than help.
+
+Judge focus
+- Check whether gains come from better reasoning, not just longer outputs.
+
+## H17: Draft-as-Query Iter-RetGen
+
+Hypothesis
+- Using the model's current draft answer as the next retrieval query will surface missing evidence that the original question did not state explicitly.
+
+Implementation sketch
+- Generate a first-pass response from the question.
+- Use that draft, or a compressed version of it, as the next retrieval query and regenerate with the expanded evidence set.
+- Paper: [Enhancing Retrieval-Augmented Large Language Models with Iterative Retrieval-Generation Synergy](https://arxiv.org/abs/2305.15294)
+
+Expected upside
+- The draft exposes latent information needs that are often absent from the user question alone.
+
+Main risk
+- Early wrong drafts can anchor retrieval toward the wrong part of the corpus.
+
+Judge focus
+- Look for gains on multi-hop questions without a spike in self-reinforcing errors.
+
+## H18: Whole-Context Iterative Refresh
+
+Hypothesis
+- Rebuilding the full evidence bundle after each retrieval-generation round will work better than only appending local snippets when the question evolves over multiple hops.
+
+Implementation sketch
+- After each iteration, recompute the full retrieved context using both the original question and the latest generated draft.
+- Replace the answer context wholesale instead of endlessly appending more evidence.
+- Paper: [Enhancing Retrieval-Augmented Large Language Models with Iterative Retrieval-Generation Synergy](https://arxiv.org/abs/2305.15294)
+
+Expected upside
+- This can keep the prompt coherent and reduce stale or contradictory evidence accumulation.
+
+Main risk
+- Full refreshes may discard a previously useful chunk unless dedup and carry-forward logic are careful.
+
+Judge focus
+- Compare evidence coherence and token efficiency, not just raw correctness.
+
+## H19: CoT-Sentence Retrieval
+
+Hypothesis
+- Using the latest chain-of-thought sentence as the next retrieval query will improve recall for multi-hop questions over question-only retrieval.
+
+Implementation sketch
+- Generate one reasoning sentence at a time.
+- Use the latest sentence as the sub-query for the next retrieval step, then continue reasoning with the expanded evidence set.
+- Paper: [Interleaving Retrieval with Chain-of-Thought Reasoning](https://arxiv.org/abs/2212.10509)
+
+Expected upside
+- Each reasoning step can focus retrieval on the current unresolved hop.
+
+Main risk
+- Hallucinated intermediate reasoning can steer retrieval away from the answer.
+
+Judge focus
+- Inspect whether retrieval recall improves before trusting downstream answer gains.
+
+## H20: Final Read over Accumulated Evidence
+
+Hypothesis
+- After iterative retrieval, a final answer pass over the union of collected evidence will outperform answering directly from the last retrieval step alone.
+
+Implementation sketch
+- Keep all retrieved paragraphs across IRCoT-style steps.
+- Run a clean final answer prompt over the accumulated evidence after the loop ends.
+- Paper: [Interleaving Retrieval with Chain-of-Thought Reasoning](https://arxiv.org/abs/2212.10509)
+
+Expected upside
+- The final answer step can integrate all hops without forcing the last retrieval call to carry the entire burden.
+
+Main risk
+- The accumulated pool can become too noisy without strong deduplication.
+
+Judge focus
+- Check whether final-pass gains survive once prompt length is controlled.
+
+## H21: Forward-Looking Sentence Search
+
+Hypothesis
+- Predicting the next sentence before writing it and using that prediction as a retrieval query will improve long-form grounded generation.
+
+Implementation sketch
+- Before committing the next sentence, ask the model for a one-sentence forecast of what it expects to say next.
+- Use that forecast as the retrieval query, then regenerate the sentence with the retrieved evidence.
+- Paper: [Active Retrieval Augmented Generation](https://arxiv.org/abs/2305.06983)
+
+Expected upside
+- This lets retrieval follow the model's future information needs instead of staying anchored to the original question only.
+
+Main risk
+- Weak forecasts can produce irrelevant retrieval and add an unstable extra step.
+
+Judge focus
+- Check whether future-looking retrieval helps enough to offset the extra generation turn.
+
+## H22: Low-Confidence Regeneration
+
+Hypothesis
+- Regenerating only when the next sentence contains low-confidence tokens will beat always-retrieve and never-retrieve baselines on cost-adjusted quality.
+
+Implementation sketch
+- Monitor token confidence or a cheap uncertainty proxy while drafting the next sentence.
+- Trigger retrieval-plus-regeneration only when confidence drops below a threshold.
+- Paper: [Active Retrieval Augmented Generation](https://arxiv.org/abs/2305.06983)
+
+Expected upside
+- This makes active retrieval selective instead of paying the same cost on every step.
+
+Main risk
+- Confidence estimates may be noisy and miss precisely the hard factual cases.
+
+Judge focus
+- Require evidence of better accuracy-per-token, not just better raw quality.
+
+## H23: Uncertainty-Triggered Search
+
+Hypothesis
+- Explicitly detecting uncertainty markers in the reasoning trace and turning them into search opportunities will improve difficult reasoning questions.
+
+Implementation sketch
+- Add a lightweight detector for uncertainty phrases or confidence dips in the reasoning stream.
+- When triggered, pause reasoning, issue a search query, and continue with the retrieved evidence.
+- Paper: [Search-o1: Agentic Search-Enhanced Large Reasoning Models](https://arxiv.org/abs/2501.05366)
+
+Expected upside
+- This borrows Search-o1's central intuition without needing a full new reasoning model.
+
+Main risk
+- Keyword-style uncertainty detection can be brittle and easy to game.
+
+Judge focus
+- Compare failure modes on hard questions where the baseline currently guesses from parametric memory.
+
+## H24: Reason-in-Documents Compression
+
+Hypothesis
+- A dedicated "reason in documents" pass that compresses retrieved pages into task-relevant evidence will outperform directly stuffing raw retrieval into the main reasoning prompt.
+
+Implementation sketch
+- Insert a document-analysis pass between retrieval and answering.
+- Ask it to extract only the facts that move the current reasoning step forward, then pass the compressed result onward.
+- Paper: [Search-o1: Agentic Search-Enhanced Large Reasoning Models](https://arxiv.org/abs/2501.05366)
+
+Expected upside
+- This should reduce noise from long retrieved pages while preserving the facts the answer step actually needs.
+
+Main risk
+- The compression pass can accidentally delete a critical qualifier or number.
+
+Judge focus
+- Inspect whether evidence density improves without hiding the provenance of important facts.
+
+## H25: Adaptive Stop/Continue Controller
+
+Hypothesis
+- Explicitly deciding whether to stop or continue retrieving at each iteration will outperform a fixed number of retrieval loops.
+
+Implementation sketch
+- Add a stop/continue decision after each retrieval step using the current evidence state.
+- Start with a lightweight approximation of Stop-RAG's controller before considering any learned policy.
+- Paper: [Stop-RAG: Value-Based Retrieval Control for Iterative RAG](https://arxiv.org/abs/2510.14337)
+
+Expected upside
+- This directly targets wasted retrieval loops and late-stage distraction.
+
+Main risk
+- Stopping too early is often more damaging than one extra retrieval step.
+
+Judge focus
+- Measure both accuracy and average iterations per question.
+
+## H26: Q-Lambda Stopping Policy
+
+Hypothesis
+- A learned stop policy trained to value future retrieval benefit, rather than current confidence alone, will make better stopping decisions on multi-hop questions.
+
+Implementation sketch
+- Approximate the paper's Q(lambda) idea with an offline stop-policy scorer over partial retrieval traces.
+- Use the scorer only for the stop/continue decision, leaving the rest of the pipeline unchanged.
+- Paper: [Stop-RAG: Value-Based Retrieval Control for Iterative RAG](https://arxiv.org/abs/2510.14337)
+
+Expected upside
+- Value-based control should outperform simple confidence heuristics when more retrieval is useful but not yet obviously so.
+
+Main risk
+- This is higher effort and may be too data-hungry for the likely gain.
+
+Judge focus
+- Reject if the policy-training overhead is large relative to the end-to-end improvement.
+
+## H27: Evidence-Only Stop State
+
+Hypothesis
+- For stopping decisions, using only the main question plus retrieved evidence may be sufficient, without feeding the full intermediate reasoning trace.
+
+Implementation sketch
+- Build the stop-state representation from the question and currently retrieved chunks only.
+- Compare that against richer stop-state variants that also include intermediate search queries or draft answers.
+- Paper: [Stop-RAG: Value-Based Retrieval Control for Iterative RAG](https://arxiv.org/abs/2510.14337)
+
+Expected upside
+- A simpler state may be more stable and cheaper while still capturing whether more evidence is needed.
+
+Main risk
+- The missing reasoning trace may hide whether the model has already resolved the hard part of the question.
+
+Judge focus
+- Prefer the simplest state that preserves decision quality.
+
+## H28: Semantic-Exact Weighted Fusion
+
+Hypothesis
+- Letting the agent adaptively mix dense semantic search with exact lexical search will outperform a single fixed retrieval mode.
+
+Implementation sketch
+- Expose both semantic and exact retrieval, then let the prompt or control logic set fusion weights per query.
+- Start with a small discrete set of fusion profiles instead of free-form weights.
+- Paper: [Interact-RAG: Reason and Interact with the Corpus, Beyond Black-Box Retrieval](https://arxiv.org/abs/2510.27566)
+
+Expected upside
+- This captures the main benefit of Interact-RAG without requiring a full interaction engine.
+
+Main risk
+- Adaptive fusion adds another control surface that can oscillate or overfit.
+
+Judge focus
+- Check whether mixed-mode retrieval wins on both entity-heavy and semantic paraphrase questions.
+
+## H29: Entity-Anchored Matching
+
+Hypothesis
+- When a key entity is clear, forcing an entity-anchored retrieval step will reduce distraction from semantically similar but wrong documents.
+
+Implementation sketch
+- Detect a candidate anchor entity from the question or current reasoning state.
+- Run a focused entity match step before broader retrieval or reranking.
+- Paper: [Interact-RAG: Reason and Interact with the Corpus, Beyond Black-Box Retrieval](https://arxiv.org/abs/2510.27566)
+
+Expected upside
+- Anchoring is especially attractive for finance and multi-entity questions where near-neighbor confusion is common.
+
+Main risk
+- Wrong entity extraction will sharply narrow retrieval to the wrong target.
+
+Judge focus
+- Inspect entity-disambiguation failures rather than only aggregate metrics.
+
+## H30: Context Shaping Filters
+
+Hypothesis
+- Explicitly including, excluding, and resizing the current working set of documents will improve agentic retrieval over repeated blind top-`k` calls.
+
+Implementation sketch
+- Add simple controls for `include_docs`, `exclude_docs`, and retrieval-scale adjustment around the current candidate set.
+- Keep the controls deterministic and lightweight so they are attributable in evaluation.
+- Paper: [Interact-RAG: Reason and Interact with the Corpus, Beyond Black-Box Retrieval](https://arxiv.org/abs/2510.27566)
+
+Expected upside
+- This may reduce repeated retrieval noise without needing a new retriever.
+
+Main risk
+- Bad early filters can permanently hide the evidence needed later.
+
+Judge focus
+- Check whether the filters improve context quality without making the system fragile to early mistakes.
+
+## H31: Planner-Reasoner-Executor Workflow
+
+Hypothesis
+- Separating high-level planning, adaptive reasoning, and concrete execution will outperform a single monolithic prompted agent on complex retrieval tasks.
+
+Implementation sketch
+- Use a prompt-only three-stage workflow: planner for decomposition, reasoner for step control, executor for concrete retrieval actions.
+- Keep the stages narrow and explicit rather than asking one prompt to do everything.
+- Paper: [Interact-RAG: Reason and Interact with the Corpus, Beyond Black-Box Retrieval](https://arxiv.org/abs/2510.27566)
+
+Expected upside
+- This should make behavior more legible and reduce tool-use drift.
+
+Main risk
+- Extra orchestration can add latency and brittle handoff errors.
+
+Judge focus
+- Look for cleaner action traces and better retrieval choices, not just longer reasoning.
+
+## H32: Successful-Trajectory Agent Distillation
+
+Hypothesis
+- Fine-tuning or imitation on only successful retrieval trajectories will produce a more reliable agent than pure prompting alone.
+
+Implementation sketch
+- Treat this as a high-effort card: collect successful planner/action traces and distill them into a smaller policy if the lighter prompt-only cards win first.
+- Mask retrieved content during training as in the paper if this path is ever pursued.
+- Paper: [Interact-RAG: Reason and Interact with the Corpus, Beyond Black-Box Retrieval](https://arxiv.org/abs/2510.27566)
+
+Expected upside
+- Distillation could internalize the workflow so later inference is cheaper and more stable.
+
+Main risk
+- This likely exceeds the practical scope of the current repo and may not justify the engineering cost.
+
+Judge focus
+- Treat this as a strategic bet; require a much larger gain before accepting the added complexity.
+
+### A-RAG Interface Design
+
+## H33: Sentence-Boundary Chunking
+
+Hypothesis
+- Chunking near sentence boundaries instead of by raw window cuts will improve downstream retrieval and reduce broken evidence spans.
+
+Implementation sketch
+- Keep roughly the same chunk budget, but pack text by sentence-aware boundaries before falling back to raw slicing.
+- Preserve mappings from sentences back to parent chunks for later retrieval stages.
+- Paper: [A-RAG: Scaling Agentic Retrieval-Augmented Generation via Hierarchical Retrieval Interfaces](https://arxiv.org/html/2602.03442v1#S3.SS1.SSS0.Px1)
+
+Expected upside
+- This is a low-risk structural improvement that aligns well with multi-stage retrieval.
+
+Main risk
+- Uneven chunk lengths may hurt embedding consistency or index balance.
+
+Judge focus
+- Compare both retrieval quality and chunk-count stability.
+
+## H34: Sentence-Level Semantic Search
+
+Hypothesis
+- Searching over sentence embeddings and then aggregating back to chunks will outperform chunk-only dense retrieval on multi-hop questions.
+
+Implementation sketch
+- Embed sentences, retrieve the highest-scoring sentences for a query, then aggregate by parent chunk.
+- Return chunk ids plus matched sentence snippets rather than raw whole-chunk scores.
+- Paper: [A-RAG: Scaling Agentic Retrieval-Augmented Generation via Hierarchical Retrieval Interfaces](https://arxiv.org/html/2602.03442v1#S3.SS2.SSS0.Px2)
+
+Expected upside
+- Fine-grained matching should surface the right chunk even when only one sentence is relevant.
+
+Main risk
+- Sentence-level indexing adds more objects and may create recall fragmentation.
+
+Judge focus
+- Verify that sentence retrieval improves evidence precision without exploding index size.
+
+## H35: Runtime Keyword Search
+
+Hypothesis
+- A lightweight runtime keyword search path will recover exact entity and metric mentions that dense retrieval misses.
+
+Implementation sketch
+- Add an exact-match retrieval path at query time instead of relying on dense retrieval alone.
+- Use it selectively for entity-heavy or terminology-sensitive questions.
+- Paper: [A-RAG: Scaling Agentic Retrieval-Augmented Generation via Hierarchical Retrieval Interfaces](https://arxiv.org/html/2602.03442v1#S3.SS1.SSS0.Px3)
+
+Expected upside
+- This should help with named entities, acronyms, and exact financial terms.
+
+Main risk
+- Pure lexical search can over-prioritize superficial matches.
+
+Judge focus
+- Check whether keyword wins come from true exact evidence rather than noisy term overlap.
+
+## H36: Keyword-Weighted Snippet Return
+
+Hypothesis
+- Returning only keyword-bearing sentences as snippets, weighted toward longer and more specific keywords, will make lexical retrieval more usable for agents.
+
+Implementation sketch
+- Score exact matches using keyword frequency and keyword length.
+- Return compact snippets made only of sentences containing matched keywords.
+- Paper: [A-RAG: Scaling Agentic Retrieval-Augmented Generation via Hierarchical Retrieval Interfaces](https://arxiv.org/html/2602.03442v1#S3.SS2.SSS0.Px1)
+
+Expected upside
+- Compact snippets can increase evidence density and make lexical results easier to judge.
+
+Main risk
+- Snippet extraction may omit nearby qualifiers that change the answer.
+
+Judge focus
+- Inspect whether snippet compaction preserves the decisive local context.
+
+## H37: Chunk Read with Neighbor Access
+
+Hypothesis
+- Letting the agent explicitly open a chunk and optionally its adjacent chunks will outperform always injecting the full top-`k` set.
+
+Implementation sketch
+- Separate discovery from full reading: retrieval tools return ids and snippets, then a read tool fetches the full chunk only when asked.
+- Allow optional adjacent-chunk reads for continuity around tables or split explanations.
+- Paper: [A-RAG: Scaling Agentic Retrieval-Augmented Generation via Hierarchical Retrieval Interfaces](https://arxiv.org/html/2602.03442v1#S3.SS2.SSS0.Px3)
+
+Expected upside
+- This can reduce prompt bloat while preserving the ability to recover local context.
+
+Main risk
+- Too many read decisions can slow the loop and create brittle control logic.
+
+Judge focus
+- Require a clear token-efficiency win, not just a different prompt shape.
+
+## H38: ReAct Loop + Context Tracker
+
+Hypothesis
+- A simple one-tool-at-a-time ReAct loop combined with explicit tracking of already-read chunks will reduce redundant retrieval and improve evidence diversity.
+
+Implementation sketch
+- Keep tool use sequential and explicit rather than parallel or heavily orchestrated.
+- Track read chunk ids and return a zero-cost notification when the agent tries to reread the same chunk.
+- Paper: [A-RAG: Scaling Agentic Retrieval-Augmented Generation via Hierarchical Retrieval Interfaces](https://arxiv.org/html/2602.03442v1#S3.SS3)
+
+Expected upside
+- This is a practical way to gain some agentic benefits without building a complex controller.
+
+Main risk
+- The one-tool loop may underperform more aggressive controllers on hard questions.
+
+Judge focus
+- Check whether redundant reads drop and whether the saved budget converts into useful exploration.
+
+### A-RAG Related Methods
+
+## H39: Query Rewriting
+
+Hypothesis
+- Rewriting the user question into a retrieval-optimized query before search will improve first-pass recall on under-specified questions.
+
+Implementation sketch
+- Add a lightweight query-rewrite step before retrieval, preserving the original question for answer generation.
+- Prefer a deterministic or very small prompt so the change stays attributable.
+- Paper source: [A-RAG related-work summary of query rewriting / RQ-RAG](https://arxiv.org/html/2602.03442v1#S2.SS1)
+
+Expected upside
+- A better query can solve many retrieval misses without touching the index.
+
+Main risk
+- Rewrites can drift semantically and over-narrow the search.
+
+Judge focus
+- Compare rewritten-query recall directly against answer accuracy.
+
+## H40: Adaptive Retrieval Routing
+
+Hypothesis
+- Routing simple questions to cheap retrieval and harder questions to richer retrieval policies will improve cost-adjusted performance.
+
+Implementation sketch
+- Add a small complexity classifier or heuristic that chooses among retrieval modes, for example dense-only versus hybrid or iterative.
+- Keep the routing decision observable so failures are diagnosable.
+- Paper source: [A-RAG related-work summary of adaptive routing / Adaptive-RAG](https://arxiv.org/html/2602.03442v1#S2.SS1)
+
+Expected upside
+- This can concentrate expensive retrieval only where it is likely to matter.
+
+Main risk
+- Bad routing decisions create inconsistent behavior and hard-to-debug regressions.
+
+Judge focus
+- Evaluate both average cost and worst-case failure patterns.
+
+## H41: Corrective Retrieval Evaluation
+
+Hypothesis
+- Scoring the retrieved set itself for likely usefulness before answer generation will help catch low-quality retrieval and trigger recovery behavior.
+
+Implementation sketch
+- Add a retrieval-quality check after search and before answer generation.
+- If the set looks weak or contradictory, retry with a broader or rewritten query instead of proceeding blindly.
+- Paper source: [A-RAG related-work summary of retrieval quality evaluation / CRAG](https://arxiv.org/html/2602.03442v1#S2.SS1)
+
+Expected upside
+- This targets retrieval failures directly instead of hoping the answer prompt will recover.
+
+Main risk
+- Quality checks can become just another noisy heuristic layered on top of retrieval.
+
+Judge focus
+- Look for fewer catastrophic retrieval misses, not only small average gains.
+
+## H42: GraphRAG Community Retrieval
+
+Hypothesis
+- Building a graph-level view of the corpus and retrieving both local entity evidence and higher-level community summaries will improve multi-hop coverage.
+
+Implementation sketch
+- Construct a lightweight entity-relation or document-link graph, plus higher-level cluster summaries.
+- Retrieve both node-local evidence and broader community context for multi-hop questions.
+- Paper source: [A-RAG appendix summary of GraphRAG](https://arxiv.org/html/2602.03442v1#A2.I1.i1)
+
+Expected upside
+- Community-level retrieval may help when the answer needs both local facts and global context.
+
+Main risk
+- Graph construction can be expensive and fragile on noisy documents.
+
+Judge focus
+- Demand a real multi-hop gain before accepting graph-build complexity.
+
+## H43: RAPTOR Recursive Summaries
+
+Hypothesis
+- Recursive bottom-up summarization of chunks into a tree will improve retrieval for broad or hierarchical questions.
+
+Implementation sketch
+- Summarize leaf chunks upward into a small hierarchy.
+- Retrieve at multiple levels, then descend to the leaves only where needed.
+- Paper source: [A-RAG related-work summary of RAPTOR](https://arxiv.org/html/2602.03442v1#S2.SS2)
+
+Expected upside
+- Hierarchical summaries can guide retrieval toward the right region of the corpus faster than flat search.
+
+Main risk
+- Summary compression may erase the exact number or phrase needed for the final answer.
+
+Judge focus
+- Check whether high-level summaries help discovery without hiding leaf-level evidence.
+
+## H44: LightRAG Local-Global Search
+
+Hypothesis
+- Combining local graph retrieval with broader global search will outperform either narrow evidence lookup or broad search alone on compositional questions.
+
+Implementation sketch
+- Maintain both local neighborhood retrieval and a broader global graph or corpus search path.
+- Fuse them differently depending on whether the question looks entity-centric or summary-centric.
+- Paper source: [A-RAG related-work summary of LightRAG](https://arxiv.org/html/2602.03442v1#S2.SS2)
+
+Expected upside
+- This can widen coverage without giving up precise local grounding.
+
+Main risk
+- The system can overfetch context and lose the efficiency benefit.
+
+Judge focus
+- Prefer wins that come from better coverage, not just larger prompts.
+
+## H45: HippoRAG2 Memory Walks
+
+Hypothesis
+- Personalized PageRank-style walks over a memory graph will improve single-step multi-hop retrieval compared with flat top-`k` search.
+
+Implementation sketch
+- Build a lightweight graph over entities or chunks and run graph-walk retrieval seeded by the question.
+- Use the walk output as a candidate set for final chunk selection.
+- Paper source: [A-RAG appendix summary of HippoRAG2](https://arxiv.org/html/2602.03442v1#A2.I1.i2)
+
+Expected upside
+- Graph walks can surface indirectly connected evidence that dense similarity misses.
+
+Main risk
+- Poor graph quality can make the walk confidently wrong.
+
+Judge focus
+- Inspect whether gains come from better path coverage rather than retrieval luck.
+
+## H46: LinearRAG Hierarchical Entity Graph
+
+Hypothesis
+- Replacing heavy relation extraction with a simpler entity-centric hierarchical graph will capture some graph-RAG benefits at lower ingestion cost.
+
+Implementation sketch
+- Extract entities, build a simplified hierarchy, and use two-stage retrieval over the graph and original chunks.
+- Keep graph construction intentionally lightweight.
+- Paper source: [A-RAG appendix summary of LinearRAG](https://arxiv.org/html/2602.03442v1#A2.I1.i3)
+
+Expected upside
+- This may be the most practical graph-flavored experiment for the current codebase.
+
+Main risk
+- Dropping relation extraction may throw away exactly the structure needed for reasoning.
+
+Judge focus
+- Compare ingestion overhead directly against any retrieval gain.
+
+## H47: FaithfulRAG Conflict Modeling
+
+Hypothesis
+- Explicitly modeling conflicts between retrieved evidence and the model's parametric beliefs will improve answer faithfulness when sources disagree.
+
+Implementation sketch
+- Add a conflict-detection pass that flags when retrieved evidence appears to contradict the model's first-pass answer or other retrieved chunks.
+- Require the final answer to resolve or acknowledge the conflict explicitly.
+- Paper source: [A-RAG appendix summary of FaithfulRAG](https://arxiv.org/html/2602.03442v1#A2.I1.i4)
+
+Expected upside
+- This directly targets a common failure mode in RAG: confident answers built on unresolved conflicts.
+
+Main risk
+- Conflict detection can be noisy and overly cautious.
+
+Judge focus
+- Inspect contradiction handling, not just average accuracy.
+
+## H48: Self-RAG Self-Reflection
+
+Hypothesis
+- Adding explicit self-reflection steps about whether more evidence is needed and whether current evidence is trustworthy will improve agentic retrieval decisions.
+
+Implementation sketch
+- Insert short reflection prompts before final answering and after weak retrieval results.
+- Keep the reflections structured so they can trigger specific actions such as retrieve, revise, or answer.
+- Paper source: [A-RAG related-work summary of Self-RAG](https://arxiv.org/html/2602.03442v1#S2.SS3)
+
+Expected upside
+- Structured reflection may improve both retrieval timing and answer caution.
+
+Main risk
+- Reflection can easily become verbose self-talk with little operational value.
+
+Judge focus
+- Require reflections to change behavior in measurable ways, not just lengthen traces.
+
+## H49: RA-ISF Iterative Self-Feedback
+
+Hypothesis
+- Iteratively critiquing and revising the current answer or retrieval state will improve multi-step QA over one-pass answer generation.
+
+Implementation sketch
+- After each answer draft, run a focused self-feedback pass that identifies missing evidence or unsupported claims.
+- Use the feedback to trigger one more targeted retrieval or revision cycle.
+- Paper source: [A-RAG related-work summary of RA-ISF](https://arxiv.org/html/2602.03442v1#S2.SS3)
+
+Expected upside
+- Self-feedback can recover from partial misses without needing a full new control policy.
+
+Main risk
+- Repeated feedback loops can spiral into latency without adding new information.
+
+Judge focus
+- Check whether revisions genuinely correct earlier mistakes instead of paraphrasing them.
+
+## H50: MA-RAG Specialist Agents
+
+Hypothesis
+- Using specialized roles such as planner, extractor, and answerer will outperform a single generalist prompt on complex retrieval tasks.
+
+Implementation sketch
+- Approximate MA-RAG with a small set of narrow prompts that hand off a structured state rather than free-form text.
+- Keep the specialist boundary explicit so the contribution of each role is testable.
+- Paper source: [A-RAG appendix summary of MA-RAG](https://arxiv.org/html/2602.03442v1#A2.I1.i5)
+
+Expected upside
+- Specialization may reduce prompt overload and improve consistency.
+
+Main risk
+- Multi-agent scaffolding can add ceremony faster than it adds useful signal.
+
+Judge focus
+- Reject if the extra roles do not produce cleaner evidence handling or better answer quality.
+
+## H51: RAGentA Filtering + Citations
+
+Hypothesis
+- Iterative document filtering plus citation-oriented answer formatting will improve both evidence quality and auditability.
+
+Implementation sketch
+- Add a filtering pass that trims the candidate set before final answering.
+- Require the answer prompt to preserve source attributions for the evidence it actually uses.
+- Paper source: [A-RAG appendix summary of RAGentA](https://arxiv.org/html/2602.03442v1#A2.I1.i6)
+
+Expected upside
+- Better filtering can improve answer quality, and citations make later judging easier.
+
+Main risk
+- Citation formatting can become superficial if the evidence filter is weak.
+
+Judge focus
+- Check whether cited evidence truly supports the answer, not just whether citations appear.
+
+### PageIndex
+
+## H52: Page-Level Vectorless Index
+
+Hypothesis
+- Building a page-level index with summaries and metadata, without vector embeddings, will improve long-document navigation when the answer lives in a small region of a large file.
+
+Implementation sketch
+- Represent each document as a structured page index rather than a flat chunk list.
+- Route retrieval first at the page level, then only open the promising pages for finer-grained reading.
+- Source article: [PageIndex: Vectorless, Human-Like RAG for Long Documents](https://dhrumilbhut.medium.com/pageindex-vectorless-human-like-rag-for-long-documents-092ddd56221c)
+
+Expected upside
+- This may be a better fit for long reports where page position and section locality matter more than semantic-nearest-neighbor search.
+
+Main risk
+- Without embeddings, recall can drop badly on paraphrased or indirect questions.
+
+Judge focus
+- Compare long-document recall and navigation cost, not only final accuracy.
+
+## H53: Page-to-Passage Navigation
+
+Hypothesis
+- A hierarchical navigation flow that moves from document structure to page candidates to exact passages will outperform one-shot flat retrieval on long PDFs.
+
+Implementation sketch
+- Add a staged retrieval flow: identify candidate sections or pages, summarize them, then drill into exact passages only inside the shortlisted area.
+- Keep the intermediate navigation trace visible so later agents can inspect where the answer was found.
+- Source article: [PageIndex: Vectorless, Human-Like RAG for Long Documents](https://dhrumilbhut.medium.com/pageindex-vectorless-human-like-rag-for-long-documents-092ddd56221c)
+
+Expected upside
+- This mirrors how humans search long documents and may reduce wasted context on irrelevant pages.
+
+Main risk
+- Bad page selection early in the funnel can hide the answer completely.
+
+Judge focus
+- Inspect whether the staged funnel narrows correctly before rewarding answer gains.

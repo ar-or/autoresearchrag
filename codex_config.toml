@@ -1,0 +1,12 @@
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model = "gpt-5.4"
+
+[features]
+multi_agent = true
+
+[projects."/home/rag"]
+trust_level = "trusted"
+
+[notice.model_migrations]
+"gpt-5.3-codex" = "gpt-5.4"
