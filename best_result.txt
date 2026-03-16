@@ -1,18 +1,18 @@
 status=initialized
-hypothesis_name=h04_structure_aware_chunk_boundaries
-git_commit=eede6f2cfda845e6fb2d8ef3c6fccbc2e44aebc8
-time=2026-03-16T09:23:41Z
+hypothesis_name=h34_sentence_level_semantic_search
+git_commit=82a124ed3c48677db35c66a43d58edfd5468d2ea
+time=2026-03-16T15:46:36Z
 elastic_index=feature_h04_structure_aware
 finqa_n=30
-finqa_accuracy=0.8333
-finqa_correct=25
-finqa_total_cost_usd=0.050251
+finqa_accuracy=0.9000
+finqa_correct=27
+finqa_total_cost_usd=0.043428
 hotpot_n=30
-hotpot_answer_em=0.6333
-hotpot_answer_f1=0.8179
-hotpot_sp_em=0.4333
-hotpot_sp_f1=0.7856
-hotpot_joint_em=0.3333
-hotpot_joint_f1=0.7020
-hotpot_total_cost_usd=0.036365
-notes=hypothesis id=H04; changed files=scripts/ingest.py; reingest=yes; summary=chunked on structural boundaries before falling back to sliding windows for oversized units and won the HotpotQA tiebreak after a FinQA tie; final judge decision=promoted
+hotpot_answer_em=0.6000
+hotpot_answer_f1=0.7772
+hotpot_sp_em=0.5000
+hotpot_sp_f1=0.8178
+hotpot_joint_em=0.3667
+hotpot_joint_f1=0.6880
+hotpot_total_cost_usd=0.040412
+notes=hypothesis id=H34; changed files=agent.py; reingest=no; summary=reranked retrieved chunks by the best matching sentence embedding within each chunk and improved FinQA enough to outweigh the HotpotQA decline; final judge decision=promoted
