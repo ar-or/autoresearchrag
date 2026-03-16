@@ -162,6 +162,35 @@ def _es_text_search(
     return r.json().get("hits", {}).get("hits", [])
 
 
+def _hit_identity(hit: dict[str, Any]) -> str:
+    src = hit.get("_source", {})
+    return (
+        src.get("hash_id")
+        or src.get("chunk_id")
+        or hit.get("_id")
+        or f"{src.get('document_id', '')}:{src.get('chunk_index', '')}:{src.get('text', '')[:64]}"
+    )
+
+
+def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = {}
+    rrf_k = 60
+
+    for hits in ranked_lists:
+        for rank, hit in enumerate(hits, start=1):
+            identity = _hit_identity(hit)
+            if identity not in fused:
+                fused[identity] = {"hit": hit, "score": 0.0}
+            fused[identity]["score"] += 1.0 / (rrf_k + rank)
+
+    ranked = sorted(
+        fused.values(),
+        key=lambda item: (item["score"], item["hit"].get("_score", 0.0)),
+        reverse=True,
+    )
+    return [item["hit"] for item in ranked[:k]]
+
+
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -187,7 +216,10 @@ async def retrieve(
     try:
         resp = await _openai.embeddings.create(input=query, model=EMBED_MODEL)
         vector = resp.data[0].embedding
-        hits = _es_vector_search(idx, vector, top_k)
+        candidate_k = max(top_k * 2, top_k)
+        vector_hits = _es_vector_search(idx, vector, candidate_k)
+        text_hits = _es_text_search(idx, query, candidate_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
