@@ -6,6 +6,7 @@ Public API:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import requests as _requests
 from openai import AsyncOpenAI
+from scripts.embedder import embed_batch
 
 # ---------------------------------------------------------------------------
 # Settings (mirrors oragent/src/settings.ts)
@@ -220,8 +222,7 @@ async def retrieve(
     idx = index or ELASTIC_INDEX
     top_k = k or RETRIEVAL_K
     try:
-        resp = await _openai.embeddings.create(input=query, model=EMBED_MODEL)
-        vector = resp.data[0].embedding
+        vector = (await asyncio.to_thread(embed_batch, [query]))[0]
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
