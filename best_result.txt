@@ -1,10 +1,18 @@
 status=initialized
-hypothesis_name=baseline_reindexed_develop
-git_commit=065bb8f8d1ae2725c8f6c149b05f4e5aa1b1744b
-time=2026-03-16T08:49:43Z
-elastic_index=mtrag
+hypothesis_name=h04_structure_aware_chunk_boundaries
+git_commit=eede6f2cfda845e6fb2d8ef3c6fccbc2e44aebc8
+time=2026-03-16T09:23:41Z
+elastic_index=feature_h04_structure_aware
 finqa_n=30
 finqa_accuracy=0.8333
 finqa_correct=25
-finqa_total_cost_usd=0.058086
-notes=hypothesis id=baseline_reindexed; changed files=agent.py|evaluators/agent_client.py|evaluators/finqa/evaluate.py; reingest=yes; summary=reinitialized the local FinQA index on mtrag and re-established a valid live-retrieval baseline on develop after timeout hardening; final judge decision=promoted
+finqa_total_cost_usd=0.050251
+hotpot_n=30
+hotpot_answer_em=0.6333
+hotpot_answer_f1=0.8179
+hotpot_sp_em=0.4333
+hotpot_sp_f1=0.7856
+hotpot_joint_em=0.3333
+hotpot_joint_f1=0.7020
+hotpot_total_cost_usd=0.036365
+notes=hypothesis id=H04; changed files=scripts/ingest.py; reingest=yes; summary=chunked on structural boundaries before falling back to sliding windows for oversized units and won the HotpotQA tiebreak after a FinQA tie; final judge decision=promoted
