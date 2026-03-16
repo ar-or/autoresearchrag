@@ -3,36 +3,19 @@
 Stores embeddings keyed by SHA-256 hash of the input text.
 Re-runs of ingestion scripts hit the cache instead of calling the API.
 
-Uses a file lock so multiple processes can safely share the same database.
-
 Environment variables:
   EMBED_CACHE - Path to the sqlite database (default: .embed_cache.db)
 """
 
-import fcntl
 import hashlib
 import os
 import sqlite3
 import struct
 
 EMBED_CACHE_PATH = os.environ.get("EMBED_CACHE", ".embed_cache.db")
-_LOCK_PATH = EMBED_CACHE_PATH + ".lock"
 
 _conn: sqlite3.Connection | None = None
-_lock_fd = None
 _SQLITE_VAR_LIMIT = 900
-
-
-def _acquire_lock():
-    global _lock_fd
-    if _lock_fd is None:
-        _lock_fd = open(_LOCK_PATH, "w")
-    fcntl.flock(_lock_fd, fcntl.LOCK_EX)
-
-
-def _release_lock():
-    if _lock_fd is not None:
-        fcntl.flock(_lock_fd, fcntl.LOCK_UN)
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -62,74 +45,54 @@ def _unpack(blob: bytes) -> list[float]:
 
 
 def get(text: str) -> list[float] | None:
-    _acquire_lock()
-    try:
-        row = _get_conn().execute(
-            "SELECT embedding FROM embeddings WHERE text_hash = ?", (_text_hash(text),)
-        ).fetchone()
-        if row:
-            return _unpack(row[0])
-        return None
-    finally:
-        _release_lock()
+    row = _get_conn().execute(
+        "SELECT embedding FROM embeddings WHERE text_hash = ?", (_text_hash(text),)
+    ).fetchone()
+    if row:
+        return _unpack(row[0])
+    return None
 
 
 def get_many(texts: list[str]) -> dict[str, list[float]]:
     if not texts:
         return {}
 
-    _acquire_lock()
-    try:
-        conn = _get_conn()
-        by_hash: dict[str, list[str]] = {}
-        for text in texts:
-            by_hash.setdefault(_text_hash(text), []).append(text)
+    conn = _get_conn()
+    by_hash: dict[str, list[str]] = {}
+    for text in texts:
+        by_hash.setdefault(_text_hash(text), []).append(text)
 
-        found: dict[str, list[float]] = {}
-        text_hashes = list(by_hash)
-        for start in range(0, len(text_hashes), _SQLITE_VAR_LIMIT):
-            batch = text_hashes[start : start + _SQLITE_VAR_LIMIT]
-            placeholders = ",".join("?" for _ in batch)
-            rows = conn.execute(
-                f"SELECT text_hash, embedding FROM embeddings WHERE text_hash IN ({placeholders})",
-                batch,
-            ).fetchall()
-            for text_hash, blob in rows:
-                embedding = _unpack(blob)
-                for text in by_hash.get(text_hash, []):
-                    found[text] = embedding
-        return found
-    finally:
-        _release_lock()
+    found: dict[str, list[float]] = {}
+    text_hashes = list(by_hash)
+    for start in range(0, len(text_hashes), _SQLITE_VAR_LIMIT):
+        batch = text_hashes[start : start + _SQLITE_VAR_LIMIT]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT text_hash, embedding FROM embeddings WHERE text_hash IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for text_hash, blob in rows:
+            embedding = _unpack(blob)
+            for text in by_hash.get(text_hash, []):
+                found[text] = embedding
+    return found
 
 
 def put(text: str, embedding: list[float]):
-    _acquire_lock()
-    try:
-        _get_conn().execute(
-            "INSERT OR REPLACE INTO embeddings (text_hash, embedding) VALUES (?, ?)",
-            (_text_hash(text), _pack(embedding)),
-        )
-    finally:
-        _release_lock()
+    _get_conn().execute(
+        "INSERT OR REPLACE INTO embeddings (text_hash, embedding) VALUES (?, ?)",
+        (_text_hash(text), _pack(embedding)),
+    )
 
 
 def put_many(pairs: list[tuple[str, list[float]]]):
-    _acquire_lock()
-    try:
-        conn = _get_conn()
-        conn.executemany(
-            "INSERT OR REPLACE INTO embeddings (text_hash, embedding) VALUES (?, ?)",
-            [(_text_hash(text), _pack(emb)) for text, emb in pairs],
-        )
-        conn.commit()
-    finally:
-        _release_lock()
+    conn = _get_conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO embeddings (text_hash, embedding) VALUES (?, ?)",
+        [(_text_hash(text), _pack(emb)) for text, emb in pairs],
+    )
+    conn.commit()
 
 
 def flush():
-    _acquire_lock()
-    try:
-        _get_conn().commit()
-    finally:
-        _release_lock()
+    _get_conn().commit()
