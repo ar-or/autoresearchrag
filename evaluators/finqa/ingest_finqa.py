@@ -22,7 +22,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.ingest import chunk_text, embed_batch, ensure_index, index_chunks
+from scripts.ingest import (
+    ensure_ingest_ready,
+    ingest_prepared_items,
+    prepare_document,
+)
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "dev.json"
 
@@ -65,6 +69,23 @@ def build_document_text(example: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _prepare_example(example: dict):
+    doc_id = example["id"]
+    filename = example.get("filename", doc_id)
+    text = build_document_text(example)
+    return prepare_document(
+        text=text,
+        hash_key=doc_id.replace("/", "_"),
+        fields={
+            "title": filename,
+            "source": f"finqa:{filename}",
+            "document_id": doc_id.replace("/", "_"),
+            "doc_name": filename,
+            "collection_name": "mycollection1",
+        },
+    )
+
+
 def main():
     if not DATA_PATH.exists():
         print(f"ERROR: Data not found at {DATA_PATH}")
@@ -76,32 +97,12 @@ def main():
         data = json.load(f)
     print(f"Loaded {len(data)} examples")
 
-    ensure_index()
-
-    total_chunks = 0
-    total_errors = 0
-
-    for i, ex in enumerate(data):
-        doc_id = ex["id"]
-        filename = ex.get("filename", doc_id)
-        text = build_document_text(ex)
-
-        if not text.strip():
-            continue
-
-        title = filename
-        chunks = chunk_text(text)
-
-        if not chunks:
-            continue
-
-        ok, errs = index_chunks(chunks, title, f"finqa:{filename}", doc_id.replace("/", "_"),
-                                 doc_name=filename, collection_name="mycollection1")
-        total_chunks += ok
-        total_errors += errs
-
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"  [{i+1}/{len(data)}] {filename}: {len(chunks)} chunks ({ok} ok, {errs} errors)")
+    ensure_ingest_ready()
+    total_chunks, total_errors = ingest_prepared_items(
+        data,
+        _prepare_example,
+        total_items=len(data),
+    )
 
     print(f"\nDone. Total chunks indexed: {total_chunks} ({total_errors} errors)")
 

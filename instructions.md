@@ -9,15 +9,16 @@ Purpose
 Primary Loop
 1. Read `hypothesis_backlog.md`.
 2. Walk through the hypothesis cards from top to bottom, one by one.
-3. For each hypothesis, check whether it has already been evaluated by looking in `results.csv`.
-4. If the hypothesis already has a completed row in `results.csv`, skip it and move to the next one.
-5. If the hypothesis has not been evaluated yet, spawn a new sub-agent for that hypothesis.
-6. Wait for that sub-agent to finish fully before moving to the next hypothesis.
-7. After the sub-agent finishes, refresh your view of:
+3. For each hypothesis, check `results.csv` to see whether that exact hypothesis card was already tested previously.
+4. Use the backlog card's stable `id` as the primary key for that check. Treat a hypothesis as already tested if any existing `results.csv` row has that same `hypothesis id=<card id>` recorded in `notes`.
+5. If the hypothesis was already tested previously, skip it and move to the next one. Do not spawn a duplicate sub-agent run for the same hypothesis id.
+6. If the hypothesis has not been evaluated yet, spawn a new sub-agent for that hypothesis.
+7. Wait for that sub-agent to finish fully before moving to the next hypothesis.
+8. After the sub-agent finishes, refresh your view of:
    - `develop`
    - `results.csv`
    - `best_result.txt`
-8. Then continue to the next hypothesis in `hypothesis_backlog.md`.
+9. Then continue to the next hypothesis in `hypothesis_backlog.md`.
 
 Execution Rules For The Runner
 1. Process hypotheses sequentially. Do not run multiple hypotheses in parallel.
@@ -33,6 +34,7 @@ What The Runner Must Pass To Each Sub-Agent
 - The path to `results.csv`.
 - The path to `best_result.txt`.
 - The instruction that `develop` is the current baseline branch.
+- The instruction that the current baseline Elasticsearch index is the champion's `elastic_index` recorded in `best_result.txt`.
 - The instruction that the sub-agent owns both executor and judge responsibilities for that one hypothesis.
 
 Sub-Agent Mission
@@ -58,9 +60,8 @@ Scope and Constraints
 Branch and Index Setup
 1. Start from the latest `develop`.
 2. Create a branch named `feature_<hypothesis_slug>`.
-3. Clone Elasticsearch index `mtrag` into `feature_<hypothesis_slug>`.
+3. Read the current champion from `best_result.txt` and treat its `elastic_index` value as the baseline Elasticsearch index for this experiment. If `best_result.txt` is uninitialized or lacks `elastic_index`, fall back to `mtrag`.
 4. Set environment variables:
-   - `ES_INDEX=feature_<hypothesis_slug>`
    - `N=30`
 5. Keep the hypothesis slug short, lowercase, and stable so the branch name, index name, and artifact path all match.
 
@@ -71,10 +72,12 @@ Implementation Rules
 4. Do not modify `results.csv` rows that already exist.
 
 Ingestion Rules
-1. If ingestion or document serialization changed in any way:
-   - delete all documents in `ES_INDEX` where `collection_name=mycollection1`
+1. If ingestion, chunking, embedding, or document serialization changed in any way:
+   - Clone the current champion Elasticsearch index from `best_result.txt` into `feature_<hypothesis_slug>`. If no champion index is recorded yet, clone `mtrag`.
+   - Set environment variable `ES_INDEX=feature_<hypothesis_slug>`
+   - delete all documents in the newly created `ES_INDEX` where `collection_name=mycollection1`
    - reingest FinQA with `uv run python evaluators/finqa/ingest_finqa.py`
-2. If ingestion did not change, do not reingest.
+2. Unless ingestion, chunking, embedding, or document serialization changed, do not create a new Elasticsearch index. Instead, set `ES_INDEX` to the champion's `elastic_index` from `best_result.txt` and operate on the documents that already exist there.
 3. If chunk count explodes or collapses unexpectedly after an ingestion change, stop and record the run as rejected with the reason in `notes`.
 
 Evaluation Protocol
@@ -128,15 +131,17 @@ Merge Rules
 2. If the experiment is rejected, do not merge code into `develop`.
 3. If the experiment is promoted:
    - update `best_result.txt`
+   - record the promoted run's `elastic_index` in `best_result.txt` so the next experiment inherits the winning index as its default `ES_INDEX`
    - merge the experiment branch into `develop`
    - use the promoted code as the new baseline for the next experiment
 
 Champion File
 - `best_result.txt` is the single source of truth for the current champion.
+- `best_result.txt` must include the champion's `elastic_index`, and that value is the default `ES_INDEX` baseline for the next experiment.
 - If `best_result.txt` is uninitialized, the first successful `N=30` FinQA run accepted on `develop` becomes the initial champion.
 
 Cleanup
-1. After recording results, clean up rejected branches and rejected ES indices unless they are needed for debugging.
+1. After recording results, clean up rejected branches and if created a new es index - also delete it.
 2. Keep accepted artifacts long enough to audit the promotion decision.
 3. If `develop` changed materially during the experiment, restart the hypothesis from the updated `develop`.
 

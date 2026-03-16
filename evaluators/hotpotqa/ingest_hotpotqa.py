@@ -19,9 +19,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.ingest import chunk_text, ensure_index, index_chunks
+from scripts.ingest import (
+    ensure_ingest_ready,
+    ingest_prepared_items,
+    prepare_document,
+)
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "hotpot_dev_distractor_v1.json"
+
+
+def _prepare_paragraph(item: tuple[str, str]):
+    title, text = item
+    doc_id = hashlib.sha256(title.encode()).hexdigest()[:16]
+    return prepare_document(
+        text=text,
+        hash_key=doc_id,
+        fields={
+            "title": title,
+            "source": f"hotpotqa:{title}",
+            "document_id": doc_id,
+            "doc_name": title,
+            "collection_name": "mycollection2",
+        },
+    )
 
 
 def main():
@@ -44,28 +64,14 @@ def main():
 
     print(f"Unique paragraphs: {len(paragraphs)}")
 
-    ensure_index()
-
-    total_chunks = 0
-    total_errors = 0
-
     items = list(paragraphs.items())
-    for i, (title, text) in enumerate(items):
-        if not text.strip():
-            continue
-
-        doc_id = hashlib.sha256(title.encode()).hexdigest()[:16]
-        chunks = chunk_text(text)
-        if not chunks:
-            continue
-
-        ok, errs = index_chunks(chunks, title, f"hotpotqa:{title}", doc_id,
-                                 doc_name=title, collection_name="mycollection2")
-        total_chunks += ok
-        total_errors += errs
-
-        if (i + 1) % 5000 == 0 or i == 0:
-            print(f"  [{i+1}/{len(items)}] {title}: {len(chunks)} chunks ({ok} ok, {errs} errors)")
+    ensure_ingest_ready()
+    total_chunks, total_errors = ingest_prepared_items(
+        items,
+        _prepare_paragraph,
+        total_items=len(items),
+        progress_every=5000,
+    )
 
     print(f"\nDone. Total chunks indexed: {total_chunks} ({total_errors} errors)")
 

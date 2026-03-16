@@ -35,14 +35,15 @@ def _get_client() -> OpenAI:
 def embed_batch(texts: list[str], max_retries: int = 3) -> list[list[float]]:
     """Embed texts using the realtime API, with cache and retry."""
     results = [None] * len(texts)
+    cached_embeddings = embed_cache.get_many(texts)
     uncached_indices = []
 
-    for i, t in enumerate(texts):
-        cached = embed_cache.get(t)
-        if cached is not None:
-            results[i] = cached
-        else:
+    for i, text in enumerate(texts):
+        cached = cached_embeddings.get(text)
+        if cached is None:
             uncached_indices.append(i)
+            continue
+        results[i] = cached
 
     if uncached_indices:
         uncached_texts = [texts[i] for i in uncached_indices]
@@ -75,14 +76,15 @@ def embed_batch_api(texts: list[str], batch_size: int = 50000, desc: str = "") -
     Results are stored back in the cache.
     """
     results = [None] * len(texts)
+    cached_embeddings = embed_cache.get_many(texts)
     uncached_indices = []
 
-    for i, t in enumerate(texts):
-        cached = embed_cache.get(t)
-        if cached is not None:
-            results[i] = cached
-        else:
+    for i, text in enumerate(texts):
+        cached = cached_embeddings.get(text)
+        if cached is None:
             uncached_indices.append(i)
+            continue
+        results[i] = cached
 
     cached_count = len(texts) - len(uncached_indices)
     if cached_count > 0:

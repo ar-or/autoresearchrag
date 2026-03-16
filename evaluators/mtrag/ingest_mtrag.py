@@ -21,10 +21,36 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.ingest import chunk_text, ensure_index, index_chunks
+from scripts.ingest import (
+    ensure_ingest_ready,
+    ingest_prepared_items,
+    prepare_document,
+)
 
 CORPORA_DIR = Path(__file__).resolve().parent / "data" / "mt-rag-benchmark" / "corpora" / "passage_level"
 ALL_DOMAINS = ["clapnq", "cloud", "fiqa", "govt"]
+
+
+def _prepare_passage(args: tuple[str, dict]):
+    domain, passage = args
+    text = passage.get("text", "").strip()
+    if not text:
+        return None
+
+    title = passage.get("title", "")
+    passage_id = passage.get("_id", passage.get("id", ""))
+    doc_id = hashlib.sha256(passage_id.encode()).hexdigest()[:16]
+    return prepare_document(
+        text=text,
+        hash_key=doc_id,
+        fields={
+            "title": title,
+            "source": f"mtrag:{domain}:{passage_id}",
+            "document_id": doc_id,
+            "doc_name": title or passage_id,
+            "collection_name": "mycollection3",
+        },
+    )
 
 
 def ingest_domain(domain: str):
@@ -40,30 +66,13 @@ def ingest_domain(domain: str):
     with zipfile.ZipFile(zip_path) as zf:
         jsonl_name = zf.namelist()[0]
         with zf.open(jsonl_name) as f:
-            batch_texts = []
-            batch_meta = []
-
-            for line_num, line in enumerate(f):
-                passage = json.loads(line)
-                text = passage.get("text", "").strip()
-                if not text:
-                    continue
-
-                title = passage.get("title", "")
-                passage_id = passage.get("_id", passage.get("id", ""))
-                doc_id = hashlib.sha256(passage_id.encode()).hexdigest()[:16]
-
-                chunks = chunk_text(text)
-                if not chunks:
-                    continue
-
-                ok, errs = index_chunks(chunks, title, f"mtrag:{domain}:{passage_id}", doc_id,
-                                         doc_name=title or passage_id, collection_name="mycollection3")
-                total_chunks += ok
-                total_errors += errs
-
-                if (line_num + 1) % 10000 == 0:
-                    print(f"    [{line_num+1}] {total_chunks} chunks indexed so far ({total_errors} errors)")
+            items = ((domain, json.loads(line)) for line in f)
+            total_chunks, total_errors = ingest_prepared_items(
+                items,
+                _prepare_passage,
+                progress_every=10000,
+                progress_prefix="    ",
+            )
 
     return total_chunks, total_errors
 
@@ -75,7 +84,7 @@ def main():
             print(f"ERROR: Unknown domain '{d}'. Choose from: {ALL_DOMAINS}")
             sys.exit(1)
 
-    ensure_index()
+    ensure_ingest_ready()
 
     grand_total = 0
     grand_errors = 0

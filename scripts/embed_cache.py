@@ -20,6 +20,7 @@ _LOCK_PATH = EMBED_CACHE_PATH + ".lock"
 
 _conn: sqlite3.Connection | None = None
 _lock_fd = None
+_SQLITE_VAR_LIMIT = 900
 
 
 def _acquire_lock():
@@ -69,6 +70,35 @@ def get(text: str) -> list[float] | None:
         if row:
             return _unpack(row[0])
         return None
+    finally:
+        _release_lock()
+
+
+def get_many(texts: list[str]) -> dict[str, list[float]]:
+    if not texts:
+        return {}
+
+    _acquire_lock()
+    try:
+        conn = _get_conn()
+        by_hash: dict[str, list[str]] = {}
+        for text in texts:
+            by_hash.setdefault(_text_hash(text), []).append(text)
+
+        found: dict[str, list[float]] = {}
+        text_hashes = list(by_hash)
+        for start in range(0, len(text_hashes), _SQLITE_VAR_LIMIT):
+            batch = text_hashes[start : start + _SQLITE_VAR_LIMIT]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT text_hash, embedding FROM embeddings WHERE text_hash IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for text_hash, blob in rows:
+                embedding = _unpack(blob)
+                for text in by_hash.get(text_hash, []):
+                    found[text] = embedding
+        return found
     finally:
         _release_lock()
 
