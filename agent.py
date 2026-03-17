@@ -403,6 +403,42 @@ async def _sentence_rerank_contexts(
     return [context for _, context in ranked[:top_k]]
 
 
+def _use_rich_retrieval(query: str) -> bool:
+    lowered = query.lower()
+    cues = (
+        "both",
+        "compare",
+        "which other",
+        "same",
+        "different",
+        "before",
+        "after",
+        "ratio",
+    )
+    return len(query.split()) >= 12 or any(cue in lowered for cue in cues)
+
+
+async def _rewrite_retrieval_query(query: str) -> str:
+    prompt = (
+        "Rewrite the question into a short retrieval query that preserves the original meaning, "
+        "keeps key entities, dates, and numbers, and removes filler words. "
+        "Return only the rewritten query.\n\n"
+        f"Question: {query}"
+    )
+    try:
+        resp = await _openai.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": "You rewrite questions for document retrieval."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        rewritten = (resp.choices[0].message.content or "").strip()
+        return rewritten or query
+    except Exception:
+        return query
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -410,20 +446,24 @@ async def retrieve(
 ) -> list[RetrievedContext]:
     idx = index or ELASTIC_INDEX
     top_k = k or RETRIEVAL_K
+    retrieval_query = query
+    candidate_k = max(top_k * 2, top_k)
+    if _use_rich_retrieval(query):
+        retrieval_query = await _rewrite_retrieval_query(query)
+        candidate_k = max(top_k * 3, top_k)
     try:
-        vector = (await asyncio.to_thread(embed_batch, [query]))[0]
-        candidate_k = max(top_k * 2, top_k)
+        vector = (await asyncio.to_thread(embed_batch, [retrieval_query]))[0]
         vector_hits = _es_vector_search(idx, vector, candidate_k)
-        text_hits = _es_text_search(idx, query, candidate_k)
+        text_hits = _es_text_search(idx, retrieval_query, candidate_k)
         hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
-            hits = _es_text_search(idx, query, top_k)
+            hits = _es_text_search(idx, retrieval_query, top_k)
         except Exception:
             return []
     contexts = _hits_to_contexts(hits)
     try:
-        return await _sentence_rerank_contexts(query, contexts, top_k)
+        return await _sentence_rerank_contexts(retrieval_query, contexts, top_k)
     except Exception:
         return contexts[:top_k]
 
