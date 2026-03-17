@@ -47,52 +47,33 @@ ABS_TOL = 1e-6
 # ---------------------------------------------------------------------------
 
 
-def format_table(table: list[list[str]]) -> str:
-    if not table:
-        return ""
-    header = table[0]
-    rows = table[1:]
-    col_widths = [max(len(str(cell)) for cell in col) for col in zip(*table)]
-    fmt = " | ".join(f"{{:<{w}}}" for w in col_widths)
-    lines = [fmt.format(*[str(c) for c in header])]
-    lines.append(" | ".join("-" * w for w in col_widths))
-    for row in rows:
-        lines.append(fmt.format(*[str(c) for c in row]))
-    return "\n".join(lines)
-
-
 def build_prompt(example: dict) -> str:
-    parts: list[str] = []
-    parts.append(
-        "You are given a financial report excerpt with text and a table. "
-        "Answer the question with a single number (no units, no symbols, no words). "
-        "If the answer is a percentage, express it as a decimal (e.g. 0.25 for 25%).\n"
-    )
-    pre = example.get("pre_text", [])
-    if pre:
-        parts.append("### Report text (before table)")
-        parts.append(" ".join(pre))
-        parts.append("")
-    table = example.get("table", [])
-    if table:
-        parts.append("### Table")
-        parts.append(format_table(table))
-        parts.append("")
-    post = example.get("post_text", [])
-    if post:
-        parts.append("### Report text (after table)")
-        parts.append(" ".join(post))
-        parts.append("")
+    """Send only the question — the agent must retrieve context itself."""
     question = example["qa"]["question"]
-    parts.append(f"Question: {question}")
-    parts.append("")
-    parts.append("Respond with ONLY the numeric answer (a single number, nothing else).")
-    return "\n".join(parts)
+    return (
+        f"{question}\n\n"
+        "Respond with ONLY the answer. "
+        "If the answer is numeric, give a single number (no units, no symbols, no words). "
+        "If the answer is a percentage, express it as a decimal (e.g. 0.25 for 25%). "
+        "If the answer is yes or no, respond with only 'yes' or 'no'."
+    )
 
 
 # ---------------------------------------------------------------------------
 # Answer parsing & comparison
 # ---------------------------------------------------------------------------
+
+
+def parse_boolean(text: str) -> str | None:
+    """Return 'yes' or 'no' if the text is a boolean answer, else None."""
+    cleaned = text.strip().lower()
+    cleaned = re.sub(r"```[^`]*```", "", cleaned, flags=re.DOTALL).strip()
+    # Check first meaningful word
+    first_word = cleaned.split()[0] if cleaned.split() else ""
+    first_word = first_word.rstrip(".,!;:")
+    if first_word in ("yes", "no"):
+        return first_word
+    return None
 
 
 def parse_number(text: str) -> float | None:
@@ -149,8 +130,10 @@ async def evaluate_one(
 ) -> dict:
     qid = ex["id"]
     gold_ans = ex["qa"]["exe_ans"]
+    gold_is_bool = isinstance(gold_ans, str) and gold_ans.lower() in ("yes", "no")
+    gold_bool = gold_ans.lower() if gold_is_bool else None
     try:
-        gold_float = float(gold_ans) if gold_ans is not None else None
+        gold_float = float(gold_ans) if gold_ans is not None and not gold_is_bool else None
     except (ValueError, TypeError):
         gold_float = None
     prompt = build_prompt(ex)
@@ -189,16 +172,23 @@ async def evaluate_one(
     q_cached = usage.get("cached_tokens", 0)
     q_output = usage.get("output_tokens", 0)
 
-    predicted = parse_number(raw_response)
     match = False
-    if predicted is not None and gold_float is not None:
-        match = answers_match(predicted, gold_float)
+    predicted = None
+    if gold_is_bool:
+        pred_bool = parse_boolean(raw_response)
+        predicted = pred_bool
+        match = pred_bool == gold_bool
+    else:
+        predicted = parse_number(raw_response)
+        if predicted is not None and gold_float is not None:
+            match = answers_match(predicted, gold_float)
 
     status = "PASS" if match else "FAIL"
     cost_calc = CostCalculator(model)
     q_cost = cost_calc.cost(q_input, q_cached, q_output)
+    gold_display = gold_bool if gold_is_bool else gold_float
     print(
-        f"  [{idx+1}/{total_count}] {status}  predicted={predicted}  gold={gold_float}  "
+        f"  [{idx+1}/{total_count}] {status}  predicted={predicted}  gold={gold_display}  "
         f"duration={elapsed:.1f}s  tokens={q_input}/{q_cached}/{q_output}  "
         f"cost=${q_cost:.6f}  {ex['qa']['question'][:60]}"
     )
@@ -208,7 +198,7 @@ async def evaluate_one(
         "question": ex["qa"]["question"],
         "gold_answer": gold_ans,
         "predicted_raw": raw_response[:200],
-        "predicted_number": predicted,
+        "predicted_parsed": predicted,
         "correct": match,
         "duration_s": round(elapsed, 2),
         "tokens": {"input": q_input, "cached": q_cached, "output": q_output},

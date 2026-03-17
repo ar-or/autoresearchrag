@@ -42,17 +42,13 @@ PARALLELISM = int(os.environ.get("PARALLELISM", "32"))
 
 
 def build_prompt(example: dict) -> str:
-    lines: list[str] = []
-    lines.append("Given the following paragraphs, answer the question and identify the supporting facts.\n")
-    for title, sentences in example["context"]:
-        lines.append(f"### {title}")
-        for i, sent in enumerate(sentences):
-            lines.append(f"[{i}] {sent}")
-        lines.append("")
-    lines.append(f"Question: {example['question']}\n")
-    lines.append("Respond with ONLY a JSON object (no markdown, no explanation):")
-    lines.append('{"answer": "<your answer>", "supporting_facts": [["<title>", <sentence_index>], ...]}')
-    return "\n".join(lines)
+    """Send only the question — the agent must retrieve context itself."""
+    question = example["question"]
+    return (
+        f"{question}\n\n"
+        "Respond with ONLY a JSON object (no markdown, no explanation):\n"
+        '{"answer": "<your answer>", "supporting_facts": [["<title>", <sentence_index>], ...]}'
+    )
 
 
 def parse_response(text: str) -> tuple[str, list[list]]:

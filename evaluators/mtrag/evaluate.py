@@ -10,6 +10,7 @@ Environment variables:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -52,6 +53,10 @@ PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 
+RETRIEVAL_DIR = DATA_DIR / "human" / "retrieval_tasks"
+ALL_DOMAINS = ["clapnq", "cloud", "fiqa", "govt"]
+
+
 def find_data_files() -> list[Path]:
     rag_file = DATA_DIR / "human" / "generation_tasks" / "RAG.jsonl"
     if rag_file.exists():
@@ -85,7 +90,7 @@ def group_conversations(tasks: list[dict]) -> dict[str, list[dict]]:
         cid = task.get("conversation_id", task.get("task_id", "unknown"))
         convos[cid].append(task)
     for cid in convos:
-        convos[cid].sort(key=lambda t: t.get("turn", 0))
+        convos[cid].sort(key=lambda t: int(t.get("turn", 0)))
     return dict(convos)
 
 
@@ -115,19 +120,26 @@ def get_latest_user_message(input_data) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _hash_passage_id(raw_id: str) -> str:
+    """Apply the same hash used by ingest_mtrag.py so IDs are comparable."""
+    return hashlib.sha256(raw_id.encode()).hexdigest()[:16]
+
+
 def get_gold_relevant_ids(task: dict) -> set[str]:
+    """Return hashed IDs of gold-relevant contexts.
+
+    Relevance is determined by the ``reference`` field (True means the context
+    was used to produce the gold answer).  Contexts without ``reference: true``
+    are distractors.  The returned IDs are hashed with the same scheme the
+    ingester uses so they can be compared directly against retrieved IDs.
+    """
     relevant: set[str] = set()
     for ctx in task.get("contexts", []):
-        feedback = ctx.get("feedback", {})
-        if isinstance(feedback, dict) and feedback.get("relevant", "").lower() == "yes":
-            doc_id = ctx.get("document_id", ctx.get("id", ""))
-            if doc_id:
-                relevant.add(doc_id)
-    if not relevant:
-        for ctx in task.get("contexts", []):
-            doc_id = ctx.get("document_id", ctx.get("id", ""))
-            if doc_id:
-                relevant.add(doc_id)
+        if not ctx.get("reference"):
+            continue
+        doc_id = ctx.get("document_id", ctx.get("id", ""))
+        if doc_id:
+            relevant.add(_hash_passage_id(doc_id))
     return relevant
 
 
@@ -201,6 +213,131 @@ async def run_conversation_async(
 
 
 # ---------------------------------------------------------------------------
+# Standalone retrieval tasks (BEIR format)
+# ---------------------------------------------------------------------------
+
+
+def load_retrieval_tasks() -> list[dict]:
+    """Load BEIR-format retrieval tasks from human/retrieval_tasks/.
+
+    Returns a list of dicts with keys: query_id, text, domain, qrels (dict of
+    corpus_id -> relevance score).  Only 'lastturn' queries are loaded by
+    default (closest to the agent's single-turn retrieval setting).
+    """
+    tasks: list[dict] = []
+    for domain in ALL_DOMAINS:
+        domain_dir = RETRIEVAL_DIR / domain
+        if not domain_dir.exists():
+            continue
+
+        # Load qrels
+        qrel_path = domain_dir / "qrels" / "dev.tsv"
+        if not qrel_path.exists():
+            continue
+        qrels: dict[str, dict[str, int]] = defaultdict(dict)
+        with open(qrel_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("query-id"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    qid, cid, score = parts[0], parts[1], int(parts[2])
+                    qrels[qid][cid] = score
+
+        # Load queries (prefer lastturn)
+        query_file = domain_dir / f"{domain}_lastturn.jsonl"
+        if not query_file.exists():
+            continue
+        with open(query_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                qid = obj.get("_id", obj.get("id", ""))
+                text = obj.get("text", "")
+                # Strip speaker prefix like "|user|: "
+                if text.startswith("|user|:"):
+                    text = text[len("|user|:"):].strip()
+                if qid and text and qid in qrels:
+                    tasks.append({
+                        "query_id": qid,
+                        "text": text,
+                        "domain": domain,
+                        "qrels": dict(qrels[qid]),
+                    })
+    return tasks
+
+
+def run_retrieval_task(client, task: dict) -> dict:
+    """Run a single retrieval task and return results."""
+    session_id = client.create_session()
+    try:
+        resp = client.send_message(session_id, task["text"])
+        retrieved_ids = [c.document_id for c in resp.contexts]
+        return {
+            "query_id": task["query_id"],
+            "domain": task["domain"],
+            "retrieved_ids": retrieved_ids,
+            "qrels": task["qrels"],
+            "tokens": {
+                "input": resp.usage.input_tokens,
+                "cached": resp.usage.cached_tokens,
+                "output": resp.usage.output_tokens,
+            },
+            "model": resp.model,
+        }
+    finally:
+        client.delete_session(session_id)
+
+
+async def run_retrieval_task_async(
+    sem: asyncio.Semaphore,
+    client,
+    idx: int,
+    total: int,
+    task: dict,
+) -> dict | None:
+    async with sem:
+        t0 = time.time()
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, run_retrieval_task, client, task
+            )
+        except Exception as e:
+            print(f"    [{idx}/{total}] ERROR retrieval {task['query_id']}: {e}")
+            return None
+        elapsed = time.time() - t0
+        print(f"    [{idx}/{total}] retrieval {task['domain']}:{task['query_id'][:20]} done in {elapsed:.1f}s")
+        return result
+
+
+def evaluate_retrieval_tasks(results: list[dict]):
+    """Evaluate standalone retrieval results against qrels.
+
+    The qrels corpus-IDs are raw benchmark IDs; retrieved IDs from the agent
+    are hashed.  We hash the qrels IDs to make them comparable.
+    """
+    ret_metrics_all: dict[str, list[float]] = defaultdict(list)
+    ret_metrics_by_domain: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+
+    for result in results:
+        # Hash qrel corpus IDs to match indexed IDs
+        gold_relevant = {_hash_passage_id(cid) for cid, score in result["qrels"].items() if score > 0}
+        retrieved_ids = result["retrieved_ids"]
+        if gold_relevant and retrieved_ids:
+            ret = compute_retrieval_metrics(retrieved_ids, gold_relevant)
+            domain = result["domain"]
+            for k, v in ret.items():
+                ret_metrics_all[k].append(v)
+                ret_metrics_by_domain[domain][k].append(v)
+
+    return ret_metrics_all, ret_metrics_by_domain
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -242,32 +379,26 @@ def avg(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def print_metrics(gen_all, gen_by_col, ret_all, ret_by_col):
+def _print_metric_block(title: str, metrics_all: dict, metrics_by_group: dict):
     print("\n" + "=" * 60)
-    print("RETRIEVAL METRICS")
+    print(title)
     print("=" * 60)
-    if ret_all:
-        for k in sorted(ret_all.keys()):
-            print(f"  {k:>12s}: {avg(ret_all[k]):.4f}  (n={len(ret_all[k])})")
-        for col in sorted(ret_by_col.keys()):
-            print(f"\n  [{col}]")
-            for k in sorted(ret_by_col[col].keys()):
-                print(f"    {k:>12s}: {avg(ret_by_col[col][k]):.4f}  (n={len(ret_by_col[col][k])})")
+    if metrics_all:
+        for k in sorted(metrics_all.keys()):
+            print(f"  {k:>12s}: {avg(metrics_all[k]):.4f}  (n={len(metrics_all[k])})")
+        for group in sorted(metrics_by_group.keys()):
+            print(f"\n  [{group}]")
+            for k in sorted(metrics_by_group[group].keys()):
+                print(f"    {k:>12s}: {avg(metrics_by_group[group][k]):.4f}  (n={len(metrics_by_group[group][k])})")
     else:
-        print("  No retrieval results to evaluate.")
+        print("  No results to evaluate.")
 
-    print("\n" + "=" * 60)
-    print("GENERATION METRICS")
-    print("=" * 60)
-    if gen_all:
-        for k in sorted(gen_all.keys()):
-            print(f"  {k:>12s}: {avg(gen_all[k]):.4f}  (n={len(gen_all[k])})")
-        for col in sorted(gen_by_col.keys()):
-            print(f"\n  [{col}]")
-            for k in sorted(gen_by_col[col].keys()):
-                print(f"    {k:>12s}: {avg(gen_by_col[col][k]):.4f}  (n={len(gen_by_col[col][k])})")
-    else:
-        print("  No generation results to evaluate.")
+
+def print_metrics(gen_all, gen_by_col, ret_all, ret_by_col, standalone_ret_all=None, standalone_ret_by_domain=None):
+    _print_metric_block("RETRIEVAL METRICS (generation tasks)", ret_all, ret_by_col)
+    if standalone_ret_all is not None:
+        _print_metric_block("RETRIEVAL METRICS (standalone retrieval tasks)", standalone_ret_all, standalone_ret_by_domain or {})
+    _print_metric_block("GENERATION METRICS", gen_all, gen_by_col)
     print("=" * 60)
 
 
@@ -356,7 +487,28 @@ async def async_main():
     print(f"\nPredictions saved to {out_path}")
 
     gen_all, gen_by_col, ret_all, ret_by_col = evaluate_predictions(all_predictions)
-    print_metrics(gen_all, gen_by_col, ret_all, ret_by_col)
+
+    # Run standalone retrieval tasks
+    standalone_ret_all = None
+    standalone_ret_by_domain = None
+    retrieval_tasks = load_retrieval_tasks()
+    if retrieval_tasks:
+        if MTRAG_COLLECTION:
+            retrieval_tasks = [t for t in retrieval_tasks if t["domain"] == MTRAG_COLLECTION]
+        if NUM_CONVERSATIONS > 0:
+            retrieval_tasks = retrieval_tasks[:NUM_CONVERSATIONS]
+        print(f"\nRunning {len(retrieval_tasks)} standalone retrieval task(s)...\n")
+        ret_coros = [
+            run_retrieval_task_async(sem, client, i + 1, len(retrieval_tasks), t)
+            for i, t in enumerate(retrieval_tasks)
+        ]
+        ret_results = await asyncio.gather(*ret_coros)
+        ret_results = [r for r in ret_results if r is not None]
+        standalone_ret_all, standalone_ret_by_domain = evaluate_retrieval_tasks(ret_results)
+    else:
+        print("\nNo standalone retrieval tasks found.")
+
+    print_metrics(gen_all, gen_by_col, ret_all, ret_by_col, standalone_ret_all, standalone_ret_by_domain)
 
 
 def main():

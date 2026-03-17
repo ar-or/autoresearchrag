@@ -128,9 +128,10 @@ class HttpAgentClient(AgentClient):
 
 class LocalAgentClient(AgentClient):
     def __init__(self) -> None:
-        import agent as _agent
+        import importlib
 
-        self._agent = _agent
+        module_name = os.environ.get("AGENT_MODULE", "agent")
+        self._agent = importlib.import_module(module_name)
 
     def create_session(self) -> str:
         return self._agent.create_session()

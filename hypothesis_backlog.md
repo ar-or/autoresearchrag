@@ -1226,3 +1226,125 @@ Main risk
 
 Judge focus
 - Measure unsupported-span rate, edit locality, and cost per corrected answer, not only final exact-match accuracy.
+
+### Newly Requested Papers
+
+## H63: TreeQA Logic-Tree Retrieval
+
+Hypothesis
+- Decomposing multi-hop questions into a hierarchical logic tree of verifiable sub-questions, then retrieving evidence for each node, will improve reliability and interpretability over one-shot flat retrieval.
+
+Implementation sketch
+- Build a prompt-only logic tree where the root is the original question and children are simpler sub-questions.
+- Retrieve supporting evidence per node from the existing corpus, then validate and propagate answers upward through the tree.
+- Add a lightweight self-correction pass when a node lacks sufficient evidence or conflicts with sibling results.
+- Paper source: [TreeQA: Enhanced LLM-RAG with logic tree reasoning for reliable and interpretable multi-hop question answering](https://doi.org/10.1016/j.knosys.2025.114526)
+
+Expected upside
+- This can turn opaque multi-hop retrieval into a stepwise evidence trail, making both retrieval errors and reasoning errors easier to localize.
+
+Main risk
+- Bad question decomposition can poison the whole tree and add substantial latency.
+
+Judge focus
+- Inspect node-level evidence support and whether the tree actually reduces multi-hop failure modes rather than just lengthening traces.
+
+## H64: CottonBot Static + Live Evidence Router
+
+Hypothesis
+- Combining static document retrieval with explicit live-tool evidence for time-sensitive or sensor-like queries will outperform text-only RAG on actionable questions.
+
+Implementation sketch
+- Keep the normal document retriever for stable knowledge.
+- Add a routing step that detects when the question depends on live numeric state or current external conditions and calls deterministic tools in addition to retrieval.
+- Merge the static retrieved guidance and live tool outputs into one grounded response format.
+- Paper source: [CottonBot: An AI-driven cotton farming assistant and irrigation advisor using LLM-RAG and agentic AI tools](https://doi.org/10.1016/j.atech.2025.101640)
+
+Expected upside
+- CottonBot shows that static corpus retrieval alone is insufficient when the answer must combine stored guidance with current external measurements.
+
+Main risk
+- Tool routing mistakes and heterogeneous evidence formats can make answers less coherent than text-only retrieval.
+
+Judge focus
+- Evaluate whether live-tool calls are triggered only when needed and whether the mixed evidence leads to measurably better grounded decisions.
+
+## H65: Vul-RAG Knowledge-Card Retrieval
+
+Hypothesis
+- Retrieving distilled knowledge cards, not just raw passages, will improve specialized reasoning by surfacing root-cause and remediation structure that plain text retrieval often misses.
+
+Implementation sketch
+- During ingestion, distill each source document or example into a compact structured card such as `problem`, `cause`, `evidence`, and `resolution`.
+- Retrieve over these cards first, then optionally fetch the underlying raw chunk for supporting detail.
+- Compare card-first retrieval against direct raw-text retrieval on explanation-heavy questions.
+- Paper source: [Vul-RAG: Enhancing LLM-based Vulnerability Detection via Knowledge-level RAG](https://arxiv.org/abs/2406.11147)
+
+Expected upside
+- Vul-RAG’s core claim is that knowledge-level retrieval can surface the underlying causal structure more effectively than raw example matching.
+
+Main risk
+- Distilled cards can oversimplify or hallucinate structure during ingestion, causing retrieval to become confidently wrong.
+
+Judge focus
+- Check whether retrieved cards improve explanation quality and accuracy together, rather than merely producing cleaner-looking summaries.
+
+## H66: T-RAG Hierarchical Table Retrieval
+
+Hypothesis
+- For table-heavy corpora, hierarchical memory indexing plus multi-stage retrieval will outperform flat chunk retrieval by preserving intra-table and inter-table structure.
+
+Implementation sketch
+- Build a staged table-aware index with at least table-level and row-or-cell-level representations.
+- Retrieve candidate tables first, then drill down to the most relevant rows, cells, or linked tables before final answer generation.
+- Add prompt formatting that preserves table relations rather than flattening everything into plain prose.
+- Paper source: [RAG over Tables: Hierarchical Memory Index, Multi-Stage Retrieval, and Benchmarking](https://arxiv.org/abs/2504.01346)
+
+Expected upside
+- The T-RAG framework argues that table corpora need structure-aware retrieval rather than generic text chunk search.
+
+Main risk
+- The extra indexing and retrieval stages may add overhead without helping on corpora that are mostly narrative text.
+
+Judge focus
+- Evaluate table-answer recall, retrieval latency, and whether the retrieved context preserves the table relations needed for inference.
+
+## H67: BioRAG Taxonomy-Augmented Retrieval
+
+Hypothesis
+- Augmenting retrieval with domain hierarchy metadata and iterative query decomposition will improve specialized scientific QA over generic vector search alone.
+
+Implementation sketch
+- Add domain taxonomy or hierarchy labels to documents and chunks during ingestion.
+- Expand or rerank retrieval using those labels so semantically close but hierarchically relevant evidence gets promoted.
+- For questions that likely need fresh or multi-step evidence, decompose the query and run iterative retrieval over both the index and any configured search source.
+- Paper source: [BioRAG: A RAG-LLM Framework for Biological Question Reasoning](https://arxiv.org/abs/2408.01107)
+
+Expected upside
+- BioRAG shows that specialized QA can benefit from both domain-specific representation and explicit knowledge hierarchy instead of relying on generic similarity alone.
+
+Main risk
+- Poor taxonomy coverage or noisy tagging can become a brittle filter that hides relevant evidence.
+
+Judge focus
+- Check whether hierarchy-aware retrieval improves specialized recall on hard domain terms without sharply hurting general queries.
+
+## H68: Coordinated Semantic Alignment + Evidence Constraints
+
+Hypothesis
+- Jointly improving query-evidence semantic alignment and constraining generation to the selected evidence will reduce semantic drift and unsupported claims better than optimizing retrieval and generation separately.
+
+Implementation sketch
+- Add a reranking stage that explicitly scores whether retrieved evidence matches the generation objective, not just topical similarity.
+- Convert selected evidence into a stronger control signal during answering, for example by requiring claim-to-evidence alignment, citation slots, or evidence-bounded drafting.
+- Compare this coordinated setup against the current looser handoff from retrieval to generation.
+- Paper source: [Coordinated Semantic Alignment and Evidence Constraints for Retrieval-Augmented Generation with Large Language Models](https://arxiv.org/abs/2603.04647)
+
+Expected upside
+- The paper’s core claim is that semantic alignment and evidence constraints work better when modeled together, reducing both noisy retrieval effects and generation drift.
+
+Main risk
+- Over-constraining generation can make answers brittle, extractive, or unable to synthesize across multiple pieces of evidence.
+
+Judge focus
+- Measure groundedness and factual support rates together with answer completeness and fluency.
