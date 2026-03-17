@@ -11,6 +11,9 @@ Card schema
 - `main risk`: how it can fail
 - `judge focus`: what the judge should look at beyond raw accuracy
 
+Repository note
+- Current default retrieval is not BM25-only. `agent.py` runs dense vector search plus Elasticsearch text search, fuses them with reciprocal-rank fusion, adds a page-to-child retrieval path, and sentence-reranks the merged contexts. The lexical text leg is effectively BM25 because the Elasticsearch text fields use default similarity and do not override it.
+
 
 ## H01: Hybrid Vector + Text Retrieval
 
@@ -23,7 +26,7 @@ Implementation sketch
 - Deduplicate by chunk id before returning the final top `k`.
 
 Expected upside
-- The current code falls back to text search only on failure. This hypothesis makes keyword-sensitive retrieval first-class instead of accidental.
+- The current code already fuses dense and lexical retrieval, but only with a generic RRF merge. This hypothesis tests whether a more intentionally tuned hybrid can beat the current default on exact-match and numeric-heavy questions.
 
 Main risk
 - Lexical hits can add noise and crowd out semantically relevant chunks.
@@ -920,21 +923,22 @@ Main risk
 Judge focus
 - Inspect contradiction handling, not just average accuracy.
 
-## H48: Self-RAG Self-Reflection
+## H48: Self-RAG Reflection Controller
 
 Hypothesis
 - Adding explicit self-reflection steps about whether more evidence is needed and whether current evidence is trustworthy will improve agentic retrieval decisions.
 
 Implementation sketch
-- Insert short reflection prompts before final answering and after weak retrieval results.
-- Keep the reflections structured so they can trigger specific actions such as retrieve, revise, or answer.
-- Paper source: [A-RAG related-work summary of Self-RAG](https://arxiv.org/html/2602.03442v1#S2.SS3)
+- Approximate Self-RAG with structured reflection prompts after retrieval and before final answering.
+- Restrict the reflection output to actionable decisions such as `retrieve_more`, `use_current_evidence`, `critique_answer`, or `answer_now`.
+- Keep the implementation inference-only; do not depend on training special reflection tokens.
+- Paper source: [Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection](https://arxiv.org/abs/2310.11511)
 
 Expected upside
 - Structured reflection may improve both retrieval timing and answer caution.
 
 Main risk
-- Reflection can easily become verbose self-talk with little operational value.
+- The original paper learns reflection behavior during training, so a prompt-only approximation may underdeliver.
 
 Judge focus
 - Require reflections to change behavior in measurable ways, not just lengthen traces.
@@ -1035,3 +1039,190 @@ Main risk
 
 Judge focus
 - Inspect whether the staged funnel narrows correctly before rewarding answer gains.
+
+### Retriever Model Variants
+
+API-feasibility note
+- H54-H59 are intended to be implementable with retrieval/index changes and model inference outputs only. They do not assume fine-tuning, gradient access, hidden states, or direct access to model weights.
+
+## H54: BM25 Sparse Anchor Route
+
+Hypothesis
+- For rare entities, dates, quoted phrases, and literal metric names, a BM25-first sparse route will outperform the current generic hybrid order by anchoring retrieval on exact lexical overlap before dense similarity drifts.
+
+Implementation sketch
+- Add a retrieval mode that runs the existing Elasticsearch text search first and preserves at least a small fixed number of sparse hits before any later fusion or reranking.
+- Trigger it only for obviously exact-match questions, or evaluate it as a clean ablation against the current hybrid path.
+- Keep prompt formatting and answer generation unchanged so the effect stays attributable to sparse ranking.
+- Paper source: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S5.SS1)
+
+Expected upside
+- This repo already has a BM25-style lexical leg, so testing a sparse-anchor route is low effort and easy to compare. The paper uses BM25 as its sparse baseline, making it a relevant control for exact-match slices.
+
+Main risk
+- BM25 was weaker than MonoT5 and E5 overall in the paper, so a global switch is unlikely to win.
+
+Judge focus
+- Require gains on entity-heavy, date-heavy, or quote-like questions rather than only on overall average.
+
+## H55: MonoT5 Cross-Encoder Reranking
+
+Hypothesis
+- Re-ranking a BM25 candidate pool with MonoT5 will improve final evidence precision over the current lightweight sentence-similarity reranker.
+
+Implementation sketch
+- Retrieve a wider sparse candidate pool, for example top 50 or top 100.
+- Score query-chunk pairs with MonoT5 and keep only the top final `k`.
+- Limit MonoT5 to the reranking stage so indexing stays simple and the cost remains measurable.
+- Paper source: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S5.SS1)
+
+Expected upside
+- In the paper, MonoT5 beats BM25 on both answer quality and average reasoning length, suggesting that stronger reranking can reduce noisy context.
+
+Main risk
+- Cross-encoder inference can be too slow for multi-iteration retrieval loops.
+
+Judge focus
+- Compare answer accuracy and retrieval precision against latency, not against accuracy alone.
+
+## H56: E5 Dense Retriever Swap
+
+Hypothesis
+- Replacing the current embedding retriever with an E5-based dense retriever will improve semantic recall and reduce the number of retrieval iterations on paraphrased questions.
+
+Implementation sketch
+- Re-embed the corpus with a single E5 checkpoint and store those vectors in the existing dense index.
+- Re-embed queries with the same E5 model and compare E5-only or E5-led retrieval against the current dense leg.
+- Keep downstream reranking and prompting unchanged for the first pass so the retriever swap is isolated.
+- Paper source: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S5.SS1)
+
+Expected upside
+- In the paper, E5 is the strongest retriever of the three tested and yields both the best answer quality and the fewest average iterations.
+
+Main risk
+- Re-ingestion cost is non-trivial, and E5 may underperform the current embedding model on domain-specific jargon without tuning.
+
+Judge focus
+- Check both retrieval recall and average iteration count, since E5’s reported upside is partly about shortening the reasoning loop.
+
+## H57: First-Hop Premium Retrieval
+
+Hypothesis
+- Spending more retrieval budget on the first generated query, then using a cheaper retriever on later hops, will improve cost-adjusted answer quality because the first retrieval has the strongest influence on the final answer.
+
+Implementation sketch
+- On the first retrieval only, use a larger candidate pool and the strongest reranker or retriever available, such as MonoT5 or E5.
+- On later iterations, fall back to the current cheaper hybrid path unless a low-confidence signal forces another premium retrieval.
+- Measure both answer quality and total retrieval cost per question.
+- Paper source: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#S6)
+
+Expected upside
+- The paper concludes that better retrievers shorten reasoning and emphasizes the importance of the first retrieval iteration in final answer quality.
+
+Main risk
+- Later low-quality hops can still derail the answer, so front-loading quality may not be sufficient.
+
+Judge focus
+- Look for better cost-adjusted accuracy and fewer late-stage iterations.
+
+## H58: Repeated Sub-Query Suppression
+
+Hypothesis
+- Detecting repeated or near-duplicate intermediate queries and forcing reformulation or diversification will reduce wasted retrieval iterations and improve evidence coverage.
+
+Implementation sketch
+- Track normalized generated sub-queries across iterations.
+- If a new sub-query is identical or near-duplicate to an earlier one, either reject it, add the missing entities back in, or switch retriever mode before searching again.
+- Log how often the suppression fires and whether the replacement query retrieves different evidence.
+- Paper source: [Am I on the Right Track? What Can Predicted Query Performance Tell Us about the Search Behaviour of Agentic RAG](https://arxiv.org/html/2507.10411v1#A1.SS2)
+
+Expected upside
+- The paper’s appendix reports repeated identical sub-queries even in successful E5 runs, which suggests that current agentic retrieval often wastes iterations instead of broadening evidence.
+
+Main risk
+- Some repeated queries are legitimate when the system wants the same information under a different retriever or cutoff.
+
+Judge focus
+- Require fewer redundant searches and more distinct evidence, not just more rewritten queries.
+
+## H59: KiRAG Triple-Bridge Retrieval
+
+Hypothesis
+- Triple-level iterative retrieval over extracted subject-relation-object facts will improve multi-hop recall when the missing evidence is relational rather than purely lexical.
+
+Implementation sketch
+- Build a side index of lightweight knowledge triples extracted from chunks during ingestion.
+- During iterative retrieval, search triples first to find bridge facts, then fetch the source chunks behind the best triple matches.
+- Merge triple-backed chunks with the normal chunk retriever and compare against the plain text-only pipeline.
+- Paper source: [KiRAG: Knowledge-Driven Iterative Retriever for Enhancing Retrieval-Augmented Generation](https://arxiv.org/abs/2502.18397)
+
+Expected upside
+- KiRAG argues that triple-based iterative retrieval can bridge information gaps, adapt to evolving information needs, and reduce disruption from irrelevant documents.
+
+Main risk
+- Triple extraction noise can be severe on tables, messy HTML, or narrative passages where relations are implicit rather than explicit.
+
+Judge focus
+- Inspect multi-hop recall and whether the retrieved bridge facts are actually helpful to the final answer step.
+
+### Token-Guard Related Baselines
+
+## H60: Self-Reflection Hallucination Check
+
+Hypothesis
+- A dedicated self-reflection pass that checks whether the draft answer is supported by the retrieved evidence will reduce unsupported claims without needing a full retrieval redesign.
+
+Implementation sketch
+- After drafting an answer, prompt the model to mark unsupported, ambiguous, or contradictory claims against the current context.
+- If unsupported content is detected, either revise once with the critique attached or trigger one targeted follow-up retrieval.
+- Keep the reflection output short and schema-bound so it acts as a control signal instead of a free-form essay.
+- Paper source: [Towards Mitigating Hallucination in Large Language Models via Self-Reflection](https://arxiv.org/abs/2310.06271)
+
+Expected upside
+- This gives a lightweight post-hoc faithfulness check that can catch answer errors even when retrieval itself was adequate.
+
+Main risk
+- Self-critique can rationalize the current answer instead of correcting it, adding latency without reducing hallucinations.
+
+Judge focus
+- Inspect unsupported-claim rate and correction quality, not just whether answers become longer or more cautious.
+
+## H61: Self-Refine Answer Revision Loop
+
+Hypothesis
+- A short draft-feedback-rewrite loop will improve factual precision and completeness over a single-pass answer on context-heavy QA.
+
+Implementation sketch
+- Generate an initial answer, then ask the same model for concise feedback focused on omissions, unsupported claims, and contradictions.
+- Run one or two refinement rounds that must act on that feedback while preserving grounded evidence.
+- Keep this distinct from multi-agent critique by using one model and a tightly bounded revision loop.
+- Paper source: [Self-Refine: Iterative Refinement with Self-Feedback](https://arxiv.org/abs/2303.17651)
+
+Expected upside
+- Self-Refine is cheap to prototype and may recover partially correct first drafts without changing retrieval or requiring extra models.
+
+Main risk
+- Refinement loops often paraphrase the same mistake, and repeated passes can drift away from the evidence.
+
+Judge focus
+- Verify that later drafts fix concrete factual errors or omissions rather than merely sounding cleaner.
+
+## H62: Token-Guard API-Compatible Span Checking
+
+Hypothesis
+- An API-only approximation of Token-Guard, using logprobs and prompt-based span checks instead of hidden states, will reduce hallucinations more efficiently than regenerating the whole answer.
+
+Implementation sketch
+- Approximate Token-Guard with API-visible signals only: token logprobs if available, otherwise sentence- or clause-level self-check prompts and sampled agreement.
+- Split the answer into short spans, score each span for support and logical consistency against the retrieved context, and regenerate only the weakest spans inside a local window.
+- Allow at most one global retry after local repairs so cost stays bounded.
+- Paper source: [Token-Guard: Towards Token-Level Hallucination Control via Self-Checking Decoding](https://arxiv.org/abs/2601.21969)
+
+Expected upside
+- Local repair can preserve the strong parts of an answer while focusing correction budget on the spans most likely to hallucinate.
+
+Main risk
+- The full Token-Guard method relies on token-level hidden-state and latent-space signals that many API-only models do not expose, so this approximation may be materially weaker or blocked by missing logprobs.
+
+Judge focus
+- Measure unsupported-span rate, edit locality, and cost per corrected answer, not only final exact-match accuracy.

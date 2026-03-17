@@ -66,5 +66,8 @@ coverage/
 evaluators/*/data/
 evaluators/*/predictions/
 
+# Evaluator source data exported as files
+data_as_files/
+
 # Local git worktrees used for isolated experiments
 .worktrees/
