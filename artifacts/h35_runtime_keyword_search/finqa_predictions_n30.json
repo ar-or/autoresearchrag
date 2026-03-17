@@ -1,0 +1,493 @@
+{
+  "model": "gpt-5-mini",
+  "accuracy": 0.8,
+  "wall_clock_s": 102.5,
+  "total_cost_usd": 0.0443273,
+  "total_tokens": {
+    "input": 33786,
+    "cached": 9472,
+    "output": 19006
+  },
+  "predictions": [
+    {
+      "id": "V/2008/page_17.pdf-1",
+      "question": "what is the average payment volume per transaction for american express?",
+      "gold_answer": 127.4,
+      "predicted_raw": "127.4",
+      "predicted_number": 127.4,
+      "correct": true,
+      "duration_s": 3.87,
+      "tokens": {
+        "input": 1060,
+        "cached": 1024,
+        "output": 204
+      },
+      "cost_usd": 0.0004426,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "C/2017/page_328.pdf-1",
+      "question": "what was the percentage cumulative total return for the five year period ended 31-dec-2017 of citi common stock?",
+      "gold_answer": 0.935,
+      "predicted_raw": "0.935",
+      "predicted_number": 0.935,
+      "correct": true,
+      "duration_s": 4.69,
+      "tokens": {
+        "input": 590,
+        "cached": 0,
+        "output": 268
+      },
+      "cost_usd": 0.0006835,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "DVN/2007/page_58.pdf-2",
+      "question": "what percentage of the total oil and gas mmboe comes from canada?",
+      "gold_answer": 24.69136,
+      "predicted_raw": "0.2469135802469136",
+      "predicted_number": 0.2469135802469136,
+      "correct": true,
+      "duration_s": 4.66,
+      "tokens": {
+        "input": 1199,
+        "cached": 0,
+        "output": 273
+      },
+      "cost_usd": 0.00084575,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "ETR/2011/page_341.pdf-3",
+      "question": "in 2010 what was the net change in net revenue in millions",
+      "gold_answer": 19.2,
+      "predicted_raw": "18.6",
+      "predicted_number": 18.6,
+      "correct": false,
+      "duration_s": 2.91,
+      "tokens": {
+        "input": 810,
+        "cached": 0,
+        "output": 76
+      },
+      "cost_usd": 0.0003545,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "ETR/2004/page_213.pdf-2",
+      "question": "what are the deferred fuel cost revisions as a percentage of the increase in fuel cost recovery revenues?",
+      "gold_answer": 0.60306,
+      "predicted_raw": "0.6030612245",
+      "predicted_number": 0.6030612245,
+      "correct": true,
+      "duration_s": 4.71,
+      "tokens": {
+        "input": 877,
+        "cached": 0,
+        "output": 271
+      },
+      "cost_usd": 0.00076125,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "PM/2017/page_38.pdf-1",
+      "question": "what was the change in millions of operating income from 2016 to 2017?",
+      "gold_answer": 688.0,
+      "predicted_raw": "688",
+      "predicted_number": 688.0,
+      "correct": true,
+      "duration_s": 2.29,
+      "tokens": {
+        "input": 1174,
+        "cached": 0,
+        "output": 74
+      },
+      "cost_usd": 0.0004415,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "JPM/2008/page_85.pdf-3",
+      "question": "what was jpmorgan chase & co's common equity tier 1 ( cet1 ) ratio in 2008?",
+      "gold_answer": 0.10935,
+      "predicted_raw": "0.10935",
+      "predicted_number": 0.10935,
+      "correct": true,
+      "duration_s": 14.06,
+      "tokens": {
+        "input": 1408,
+        "cached": 0,
+        "output": 1101
+      },
+      "cost_usd": 0.002554,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "PNC/2013/page_207.pdf-1",
+      "question": "at the end of 2014 , the notional value of derivatives designated as hedging instruments under gaap was what percent of the fair value?",
+      "gold_answer": 30.44323,
+      "predicted_raw": "23.3079",
+      "predicted_number": 23.3079,
+      "correct": false,
+      "duration_s": 26.3,
+      "tokens": {
+        "input": 1044,
+        "cached": 0,
+        "output": 1741
+      },
+      "cost_usd": 0.003743,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "CME/2017/page_97.pdf-5",
+      "question": "what was the increase in class a common stock issued and outstanding between years , in thousands?",
+      "gold_answer": 995.0,
+      "predicted_raw": "995",
+      "predicted_number": 995.0,
+      "correct": true,
+      "duration_s": 2.89,
+      "tokens": {
+        "input": 1097,
+        "cached": 1024,
+        "output": 74
+      },
+      "cost_usd": 0.00019185,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "PNC/2013/page_62.pdf-2",
+      "question": "in millions what was total residential mortgages balance for 2013 and 2012?",
+      "gold_answer": 3576.0,
+      "predicted_raw": "3576",
+      "predicted_number": 3576.0,
+      "correct": true,
+      "duration_s": 10.42,
+      "tokens": {
+        "input": 1352,
+        "cached": 0,
+        "output": 523
+      },
+      "cost_usd": 0.001384,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "AAPL/2004/page_36.pdf-2",
+      "question": "what was the gross margin decline in fiscal 2004 from 2003?",
+      "gold_answer": 0.2,
+      "predicted_raw": "0.002",
+      "predicted_number": 0.002,
+      "correct": true,
+      "duration_s": 9.15,
+      "tokens": {
+        "input": 1170,
+        "cached": 1152,
+        "output": 332
+      },
+      "cost_usd": 0.0006973,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "PKG/2009/page_65.pdf-4",
+      "question": "what percentage of total purchase commitments are due after 2014?",
+      "gold_answer": 0.56197,
+      "predicted_raw": "0.561967",
+      "predicted_number": 0.561967,
+      "correct": true,
+      "duration_s": 18.4,
+      "tokens": {
+        "input": 899,
+        "cached": 0,
+        "output": 973
+      },
+      "cost_usd": 0.00217075,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "LMT/2013/page_74.pdf-4",
+      "question": "what was the change in the weighted average common shares outstanding for diluted computations from 2012 to 2013 , in millions?",
+      "gold_answer": -1.9,
+      "predicted_raw": "-1.9",
+      "predicted_number": -1.9,
+      "correct": true,
+      "duration_s": 3.69,
+      "tokens": {
+        "input": 1243,
+        "cached": 0,
+        "output": 141
+      },
+      "cost_usd": 0.00059275,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "STT/2011/page_83.pdf-1",
+      "question": "in 2011 what was the amount of tax related to the unrealized losses reclassifications totaled $ 303 million , or $ 189 million after-tax,",
+      "gold_answer": 114.0,
+      "predicted_raw": "114",
+      "predicted_number": 114.0,
+      "correct": true,
+      "duration_s": 2.62,
+      "tokens": {
+        "input": 1178,
+        "cached": 0,
+        "output": 74
+      },
+      "cost_usd": 0.0004425,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "MRO/2007/page_149.pdf-2",
+      "question": "if current development costs increased in 2008 as much as in 2007 , what would the 2008 total be , in millions?",
+      "gold_answer": 2057.0,
+      "predicted_raw": "2057",
+      "predicted_number": 2057.0,
+      "correct": true,
+      "duration_s": 8.82,
+      "tokens": {
+        "input": 797,
+        "cached": 0,
+        "output": 395
+      },
+      "cost_usd": 0.00098925,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "AOS/2004/page_11.pdf-2",
+      "question": "what percentage of total aggregate contractual obligations is due to purchase obligationst?",
+      "gold_answer": 0.34011,
+      "predicted_raw": "0.34011",
+      "predicted_number": 0.34011,
+      "correct": true,
+      "duration_s": 13.4,
+      "tokens": {
+        "input": 1486,
+        "cached": 1408,
+        "output": 718
+      },
+      "cost_usd": 0.0014907,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "C/2010/page_223.pdf-3",
+      "question": "in 2010 what was the percentage change of the carrying amount of loan receivable net of the allowance",
+      "gold_answer": -0.52485,
+      "predicted_raw": "-0.5254545455",
+      "predicted_number": -0.5254545455,
+      "correct": false,
+      "duration_s": 7.45,
+      "tokens": {
+        "input": 892,
+        "cached": 0,
+        "output": 336
+      },
+      "cost_usd": 0.000895,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "MSI/2006/page_61.pdf-3",
+      "question": "what was the percent of the total long-term debt obligations that was due after 2011",
+      "gold_answer": 0.35099,
+      "predicted_raw": "0.351",
+      "predicted_number": 0.351,
+      "correct": true,
+      "duration_s": 18.6,
+      "tokens": {
+        "input": 1394,
+        "cached": 1280,
+        "output": 1100
+      },
+      "cost_usd": 0.0022605,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "ABMD/2006/page_75.pdf-1",
+      "question": "what is the decline from current future minimum lease payments and the following years expected obligation?\\\\n",
+      "gold_answer": 0.19495,
+      "predicted_raw": "332",
+      "predicted_number": 332.0,
+      "correct": false,
+      "duration_s": 5.14,
+      "tokens": {
+        "input": 1007,
+        "cached": 0,
+        "output": 266
+      },
+      "cost_usd": 0.00078375,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "AMAT/2013/page_18.pdf-2",
+      "question": "what is the applied 2019s net sales in 2018 , ( in billions ) ?",
+      "gold_answer": 7.22222,
+      "predicted_raw": "7.222222222",
+      "predicted_number": 7.222222222,
+      "correct": true,
+      "duration_s": 12.55,
+      "tokens": {
+        "input": 1218,
+        "cached": 1152,
+        "output": 718
+      },
+      "cost_usd": 0.0014813,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "DVN/2014/page_85.pdf-1",
+      "question": "what is the average amortization amount , in millions , from 2015-2019?",
+      "gold_answer": 44.8,
+      "predicted_raw": "44.8",
+      "predicted_number": 44.8,
+      "correct": true,
+      "duration_s": 2.33,
+      "tokens": {
+        "input": 637,
+        "cached": 0,
+        "output": 76
+      },
+      "cost_usd": 0.00031125,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "SPGI/2018/page_74.pdf-1",
+      "question": "what was the ratio of the pension trust assets for 2017 to 2018",
+      "gold_answer": 1.15663,
+      "predicted_raw": "1.116758933",
+      "predicted_number": 1.116758933,
+      "correct": false,
+      "duration_s": 44.31,
+      "tokens": {
+        "input": 1390,
+        "cached": 0,
+        "output": 2574
+      },
+      "cost_usd": 0.0054955,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "ZBH/2003/page_58.pdf-3",
+      "question": "what percent of inventory is ready for liquidation ( sale ) in 2003?",
+      "gold_answer": 0.72825,
+      "predicted_raw": "0.7283",
+      "predicted_number": 0.7283,
+      "correct": true,
+      "duration_s": 13.6,
+      "tokens": {
+        "input": 1497,
+        "cached": 0,
+        "output": 910
+      },
+      "cost_usd": 0.00219425,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "AMT/2005/page_105.pdf-2",
+      "question": "what is the total value of net operating loss carryforwards?",
+      "gold_answer": 4575515.0,
+      "predicted_raw": "4575515",
+      "predicted_number": 4575515.0,
+      "correct": true,
+      "duration_s": 6.46,
+      "tokens": {
+        "input": 1106,
+        "cached": 1024,
+        "output": 332
+      },
+      "cost_usd": 0.0007101,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "ETR/2015/page_131.pdf-1",
+      "question": "what is the percent change in annual long-term debt maturities from 2016 to 2017?",
+      "gold_answer": 2.75566,
+      "predicted_raw": "2.755657",
+      "predicted_number": 2.755657,
+      "correct": true,
+      "duration_s": 81.76,
+      "tokens": {
+        "input": 1085,
+        "cached": 0,
+        "output": 2125
+      },
+      "cost_usd": 0.00452125,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "PNC/2009/page_46.pdf-2",
+      "question": "share of total securities rated bbb/baa or below changed by how many percentage point between 2008 and 2009?",
+      "gold_answer": -1.0,
+      "predicted_raw": "1",
+      "predicted_number": 1.0,
+      "correct": false,
+      "duration_s": 9.2,
+      "tokens": {
+        "input": 1410,
+        "cached": 0,
+        "output": 522
+      },
+      "cost_usd": 0.0013965,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "PM/2017/page_38.pdf-3",
+      "question": "what is the percentage increase in interest expense?",
+      "gold_answer": 0.02581,
+      "predicted_raw": "0.025813693",
+      "predicted_number": 0.025813693,
+      "correct": true,
+      "duration_s": 20.29,
+      "tokens": {
+        "input": 1165,
+        "cached": 0,
+        "output": 1422
+      },
+      "cost_usd": 0.00313525,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "HOLX/2015/page_98.pdf-2",
+      "question": "what is the expected growth rate in amortization expense from 2016 to 2017?",
+      "gold_answer": -0.03024,
+      "predicted_raw": "-0.030243",
+      "predicted_number": -0.030243,
+      "correct": true,
+      "duration_s": 9.47,
+      "tokens": {
+        "input": 1436,
+        "cached": 1408,
+        "output": 526
+      },
+      "cost_usd": 0.0010942,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "ETR/2017/page_114.pdf-2",
+      "question": "what are the payments for entergy arkansas as a percentage of payments for entergy louisiana?",
+      "gold_answer": 0.33333,
+      "predicted_raw": "0.3333333333",
+      "predicted_number": 0.3333333333,
+      "correct": true,
+      "duration_s": 4.58,
+      "tokens": {
+        "input": 1242,
+        "cached": 0,
+        "output": 207
+      },
+      "cost_usd": 0.0007245,
+      "model": "gpt-5-mini"
+    },
+    {
+      "id": "UNP/2008/page_77.pdf-1",
+      "question": "as of december 31 , 2008 what was the percent of the total accounts payable and other liabilities that was accrued wages and vacation",
+      "gold_answer": 0.14336,
+      "predicted_raw": "0.143359375",
+      "predicted_number": 0.143359375,
+      "correct": true,
+      "duration_s": 10.61,
+      "tokens": {
+        "input": 923,
+        "cached": 0,
+        "output": 654
+      },
+      "cost_usd": 0.00153875,
+      "model": "gpt-5-mini"
+    }
+  ]
+}
