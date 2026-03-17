@@ -1,18 +1,18 @@
 status=initialized
-hypothesis_name=h26_q_lambda_stopping_policy
-git_commit=fc635a729d2c5a78ba128ccc2e1b71443fe5c634
-time=2026-03-17T11:48:53Z
+hypothesis_name=h40_adaptive_retrieval_routing
+git_commit=204f0c649b1431baa47a81408d75e83788a72de7
+time=2026-03-17T12:15:48Z
 elastic_index=feature_h04_structure_aware
 finqa_n=30
-finqa_accuracy=0.9000
-finqa_correct=27
-finqa_total_cost_usd=0.048386
+finqa_accuracy=0.8667
+finqa_correct=26
+finqa_total_cost_usd=0.048636
 hotpot_n=30
-hotpot_answer_em=0.6667
-hotpot_answer_f1=0.8317
-hotpot_sp_em=0.5333
-hotpot_sp_f1=0.8878
-hotpot_joint_em=0.3667
-hotpot_joint_f1=0.7381
-hotpot_total_cost_usd=0.040167
-notes=hypothesis id=H26; changed files=agent.py; reingest=no; summary=used a trace-based Q-lambda proxy that compared stop versus continue value from coverage gain, novelty, and question complexity; final judge decision=promoted
+hotpot_answer_em=0.7333
+hotpot_answer_f1=0.8661
+hotpot_sp_em=0.4667
+hotpot_sp_f1=0.8574
+hotpot_joint_em=0.3333
+hotpot_joint_f1=0.7390
+hotpot_total_cost_usd=0.040006
+notes=hypothesis id=H40; changed files=agent.py; reingest=no; summary=added a simple complexity router that kept easy questions on the baseline retriever and sent harder comparison-style questions through rewritten, larger-pool retrieval; final judge decision=promoted
