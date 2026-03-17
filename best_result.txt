@@ -1,18 +1,18 @@
 status=initialized
-hypothesis_name=h34_sentence_level_semantic_search
-git_commit=82a124ed3c48677db35c66a43d58edfd5468d2ea
-time=2026-03-16T15:46:36Z
+hypothesis_name=h26_q_lambda_stopping_policy
+git_commit=fc635a729d2c5a78ba128ccc2e1b71443fe5c634
+time=2026-03-17T11:48:53Z
 elastic_index=feature_h04_structure_aware
 finqa_n=30
 finqa_accuracy=0.9000
 finqa_correct=27
-finqa_total_cost_usd=0.043428
+finqa_total_cost_usd=0.048386
 hotpot_n=30
-hotpot_answer_em=0.6000
-hotpot_answer_f1=0.7772
-hotpot_sp_em=0.5000
-hotpot_sp_f1=0.8178
+hotpot_answer_em=0.6667
+hotpot_answer_f1=0.8317
+hotpot_sp_em=0.5333
+hotpot_sp_f1=0.8878
 hotpot_joint_em=0.3667
-hotpot_joint_f1=0.6880
-hotpot_total_cost_usd=0.040412
-notes=hypothesis id=H34; changed files=agent.py; reingest=no; summary=reranked retrieved chunks by the best matching sentence embedding within each chunk and improved FinQA enough to outweigh the HotpotQA decline; final judge decision=promoted
+hotpot_joint_f1=0.7381
+hotpot_total_cost_usd=0.040167
+notes=hypothesis id=H26; changed files=agent.py; reingest=no; summary=used a trace-based Q-lambda proxy that compared stop versus continue value from coverage gain, novelty, and question complexity; final judge decision=promoted

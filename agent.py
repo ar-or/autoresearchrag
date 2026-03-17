@@ -86,6 +86,14 @@ class Session:
     updated_at: str
 
 
+@dataclass
+class RetrievalTraceStep:
+    coverage: float
+    supportive_contexts: int
+    novelty_ratio: float
+    gain: float
+
+
 # ---------------------------------------------------------------------------
 # In-memory session store
 # ---------------------------------------------------------------------------
@@ -219,6 +227,136 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
 def _split_sentences(text: str) -> list[str]:
     parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     return [part.strip() for part in parts if part.strip()]
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "what",
+    "when",
+    "which",
+    "who",
+    "with",
+}
+
+
+def _query_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) >= 3 and token not in _STOPWORDS
+    }
+
+
+def _context_signature(context: RetrievedContext) -> tuple[str, str, str]:
+    return (context.document_id, context.title, context.text[:160])
+
+
+def _context_overlap(query_terms: set[str], context: RetrievedContext) -> int:
+    haystack = f"{context.title} {context.text}".lower()
+    return sum(1 for term in query_terms if term in haystack)
+
+
+def _query_complexity_bonus(query: str) -> float:
+    lowered = query.lower()
+    cues = (
+        "both",
+        "before",
+        "after",
+        "which other",
+        "same",
+        "different",
+        "compare",
+    )
+    return 0.15 if any(cue in lowered for cue in cues) else 0.0
+
+
+def _trace_step(
+    query: str,
+    contexts: list[RetrievedContext],
+    latest_batch: list[RetrievedContext],
+    previous_coverage: float,
+) -> RetrievalTraceStep:
+    query_terms = _query_terms(query)
+    if not query_terms or not contexts:
+        return RetrievalTraceStep(
+            coverage=0.0,
+            supportive_contexts=0,
+            novelty_ratio=0.0,
+            gain=0.0,
+        )
+
+    matched_terms: set[str] = set()
+    supportive_contexts = 0
+    for context in contexts:
+        overlap = _context_overlap(query_terms, context)
+        if overlap >= 2:
+            supportive_contexts += 1
+        haystack = f"{context.title} {context.text}".lower()
+        matched_terms.update(term for term in query_terms if term in haystack)
+
+    coverage = len(matched_terms) / max(len(query_terms), 1)
+    previous_signatures = {
+        _context_signature(context)
+        for context in contexts[:-len(latest_batch)]
+    } if latest_batch else set()
+    novel = sum(
+        1 for context in latest_batch if _context_signature(context) not in previous_signatures
+    )
+    novelty_ratio = novel / len(latest_batch) if latest_batch else 0.0
+    return RetrievalTraceStep(
+        coverage=coverage,
+        supportive_contexts=supportive_contexts,
+        novelty_ratio=novelty_ratio,
+        gain=max(coverage - previous_coverage, 0.0),
+    )
+
+
+def _should_continue_with_q_lambda_proxy(
+    query: str,
+    trace: list[RetrievalTraceStep],
+) -> bool:
+    if not trace:
+        return True
+    search_round = len(trace) - 1
+    if search_round >= 2:
+        return False
+
+    current = trace[-1]
+    complexity_bonus = _query_complexity_bonus(query)
+
+    continue_value = (
+        0.55 * (1.0 - current.coverage)
+        + 0.25 * current.gain
+        + 0.20 * current.novelty_ratio
+        + complexity_bonus
+        - 0.15 * search_round
+    )
+    stop_value = (
+        0.60 * current.coverage
+        + 0.20 * min(current.supportive_contexts / 2.0, 1.0)
+        + 0.20 * (1.0 - current.novelty_ratio if search_round > 0 else 0.0)
+    )
+    return continue_value > stop_value
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -361,12 +499,18 @@ async def _run_agent(
     # 4. Agent loop (tool calling)
     usage = TokenUsage()
     max_iterations = 10
+    trace = [_trace_step(user_message, contexts, contexts, 0.0)]
+    allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
 
     for _ in range(max_iterations):
+        request_kwargs: dict[str, Any] = {
+            "model": MODEL,
+            "messages": messages,
+        }
+        if allow_search:
+            request_kwargs["tools"] = [_SEARCH_TOOL]
         resp = await _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
+            **request_kwargs,  # type: ignore[arg-type]
         )
         choice = resp.choices[0]
 
@@ -382,11 +526,13 @@ async def _run_agent(
         # If the model wants to call tools, execute them and continue
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
+            latest_batch: list[RetrievedContext] = []
             for tc in choice.message.tool_calls:
                 tool_output, tool_contexts = await _handle_tool_call(
                     tc.function.name, tc.function.arguments
                 )
                 contexts.extend(tool_contexts)
+                latest_batch.extend(tool_contexts)
                 messages.append(
                     {
                         "role": "tool",
@@ -394,6 +540,15 @@ async def _run_agent(
                         "content": tool_output,
                     }
                 )
+            trace.append(
+                _trace_step(
+                    user_message,
+                    contexts,
+                    latest_batch,
+                    trace[-1].coverage,
+                )
+            )
+            allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
             continue
 
         # Done — extract content
