@@ -1,18 +1,24 @@
 # Evaluator Container
-# GPU-enabled Alpine-based Python with git, uv, codex-cli, and pre-downloaded data
+# Debian-based Python with git, uv, codex-cli, and pre-downloaded data
 #
 # Usage:  docker compose up eval
 
-FROM python:3.12-alpine
+FROM python:3.12-slim-bookworm
 
-# Install system deps: git, openssh, curl, node/npm (for codex-cli)
-RUN apk add --no-cache \
-    git \
-    openssh-client \
-    curl \
+# Install system deps for codex, model runtimes, and native Python builds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    libgomp1 \
     nodejs \
-    npm
+    npm \
+    openssh-client \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -51,8 +57,15 @@ COPY pyproject.toml uv.lock ./
 COPY scripts/ scripts/
 COPY evaluators/ evaluators/
 
-# Install Python dependencies
-RUN uv venv && uv pip install aiohttp requests openai python-dotenv
+# Install Python dependencies needed by the evaluators and retrieval-model experiments.
+RUN uv venv && uv pip install \
+    aiohttp \
+    openai \
+    python-dotenv \
+    requests \
+    sentencepiece \
+    torch \
+    transformers
 
 # Pre-download evaluator datasets
 RUN for script in evaluators/*/download_data.sh; do \
