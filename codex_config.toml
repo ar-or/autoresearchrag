@@ -3,7 +3,7 @@ sandbox_mode = "danger-full-access"
 model = "gpt-5.4"
 
 [features]
-multi_agent = true
+multi_agent = false
 
 [projects."/home/rag"]
 trust_level = "trusted"
