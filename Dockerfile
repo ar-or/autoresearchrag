@@ -58,14 +58,15 @@ COPY scripts/ scripts/
 COPY evaluators/ evaluators/
 
 # Install Python dependencies needed by the evaluators and retrieval-model experiments.
-RUN uv venv && uv pip install \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv && uv pip install \
     aiohttp \
     openai \
     python-dotenv \
     requests \
     sentencepiece \
     torch \
-    transformers
+    transformers sentence-transformers
 
 # Pre-download evaluator datasets
 RUN for script in evaluators/*/download_data.sh; do \

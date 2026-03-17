@@ -198,7 +198,14 @@ async def _run_agent(
     contexts: list[RetrievedContext] = []
     max_iterations = 15
 
-    for _ in range(max_iterations):
+    for iteration in range(max_iterations):
+        # On the last iteration, force the model to answer instead of calling tools
+        if iteration == max_iterations - 1:
+            messages.append({
+                "role": "system",
+                "content": "Tool call limit reached. You MUST now provide your final answer based on what you have found so far. Do NOT call any more tools.",
+            })
+
         resp = await _openai.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -245,7 +252,6 @@ async def _run_agent(
         print(f"    [answer] {content[:200]}")
         return content, contexts, usage
 
-    print("    [answer] (max iterations reached)")
     return "", contexts, usage
 
 
