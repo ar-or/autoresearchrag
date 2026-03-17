@@ -30,7 +30,8 @@ from openai import AsyncOpenAI
 
 MODEL: str = os.environ.get("ORAGENT_MODEL", "gpt-5-mini")
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
-DATA_ROOT: Path = Path(__file__).resolve().parent / "data_as_files"
+_MNT_DATA = Path("/mnt/data")
+DATA_ROOT: Path = _MNT_DATA if _MNT_DATA.is_dir() else Path(__file__).resolve().parent / "data_as_files"
 BASH_TIMEOUT_S: int = 30  # max seconds per bash invocation
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
@@ -174,7 +175,9 @@ _TOOLS = [
 
 SYSTEM_PROMPT = f"""\
 You are a helpful AI assistant that answers questions by searching through a collection of documents stored as files.
-You have bash access.
+You have bash access. The working directory is {DATA_ROOT}. All documents are in this folder and its subdirectories.
+
+Use ls to explore the folder structure, grep -r to search file contents, and cat to read files. Always quote file paths that contain spaces or special characters.
 
 Answer the question directly and concisely based on the documents you find. If the question involves calculations, show your work. If you cannot find relevant documents, say so.\
 """

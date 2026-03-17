@@ -66,7 +66,13 @@ def parse_response(text: str) -> tuple[str, list[list]]:
         cleaned_sp = []
         for item in sp:
             if isinstance(item, (list, tuple)) and len(item) == 2:
-                cleaned_sp.append([str(item[0]), int(item[1])])
+                title = str(item[0])
+                # Strip folder prefixes and .txt extension
+                if "/" in title:
+                    title = title.rsplit("/", 1)[-1]
+                if title.endswith(".txt"):
+                    title = title[:-4]
+                cleaned_sp.append([title, int(item[1])])
         return answer, cleaned_sp
     except (json.JSONDecodeError, ValueError, TypeError):
         return text.strip(), []

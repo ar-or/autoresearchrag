@@ -10,6 +10,7 @@ services:
       - ELASTIC_URL=http://localhost:9200
     volumes:
       - .:/home/rag
+      - ./data_as_files:/mnt/data:ro
       - ./codex_config.toml:/home/rag/.codex/config.toml:rw
       - ${HOME}/.codex/auth.json:/mnt/secrets/codex_auth.json:ro
       - ./github_deploy_key:/mnt/secrets/github_deploy_key:ro
