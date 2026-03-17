@@ -151,7 +151,7 @@ _TOOLS = [
             "description": (
                 "Execute a bash command. The working directory is the data folder "
                 "containing all document files. Use standard commands like ls, cat, rg, "
-                "grep, head, find, wc, etc. to explore and search files."
+                "grep, head, find, wc, etc. to explore and search files. Always quote file names!"
             ),
             "parameters": {
                 "type": "object",
@@ -219,7 +219,10 @@ async def _run_agent(
             for tc in choice.message.tool_calls:
                 args = json.loads(tc.function.arguments)
                 command = args.get("command", "")
+                print(f"    [bash] {command}")
                 tool_output = await asyncio.to_thread(_run_bash, command)
+                preview = tool_output[:200].replace("\n", "\\n")
+                print(f"    [out]  {preview}")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -239,8 +242,10 @@ async def _run_agent(
             continue
 
         content = choice.message.content or ""
+        print(f"    [answer] {content[:200]}")
         return content, contexts, usage
 
+    print("    [answer] (max iterations reached)")
     return "", contexts, usage
 
 

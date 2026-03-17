@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     npm \
     openssh-client \
-    pkg-config \
+    pkg-config ripgrep jq fd-find git curl wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

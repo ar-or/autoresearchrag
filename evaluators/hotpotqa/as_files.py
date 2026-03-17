@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""Export HotpotQA context paragraphs as plain text files."""
+"""Export HotpotQA paragraphs as plain text files (fullwiki setting).
 
-import hashlib
+Each unique Wikipedia paragraph becomes its own file, named by article
+title. The agent must retrieve the right paragraphs from ~66k files.
+"""
+
 import json
+import re
 from pathlib import Path
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "hotpot_dev_distractor_v1.json"
+
+
+def _safe_filename(title: str) -> str:
+    """Convert a title to a safe filename."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
+    name = name.strip(". ")
+    if not name:
+        name = "_"
+    return name + ".txt"
 
 
 def as_files(output_dir: Path):
@@ -26,8 +39,7 @@ def as_files(output_dir: Path):
     written = 0
     skipped = 0
     for title, text in paragraphs.items():
-        doc_id = hashlib.sha256(title.encode()).hexdigest()[:16]
-        filepath = output_dir / f"{doc_id}.txt"
+        filepath = output_dir / _safe_filename(title)
         if filepath.exists():
             skipped += 1
             continue
