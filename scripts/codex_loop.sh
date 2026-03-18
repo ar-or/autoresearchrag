@@ -39,19 +39,6 @@ stream_and_capture() {
                 text=$(echo "$line" | jq -r '.item.text // empty' 2>/dev/null)
                 echo "$text"
                 echo "$text" > "$LAST_MSG"
-            elif [ "$item_type" = "command_execution" ]; then
-                cmd=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null)
-                output=$(echo "$line" | jq -r '.item.aggregated_output // empty' 2>/dev/null)
-                exit_code=$(echo "$line" | jq -r '.item.exit_code // empty' 2>/dev/null)
-                echo "  > $cmd"
-                [ -n "$output" ] && echo "$output" | head -20
-                [ "$exit_code" != "0" ] && [ "$exit_code" != "null" ] && echo "  [exit $exit_code]"
-            fi
-        elif [ "$type" = "item.started" ]; then
-            item_type=$(echo "$line" | jq -r '.item.type // empty' 2>/dev/null)
-            if [ "$item_type" = "command_execution" ]; then
-                cmd=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null)
-                echo "  [running] $cmd"
             fi
         fi
     done
