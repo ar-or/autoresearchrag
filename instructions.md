@@ -54,7 +54,7 @@ Branch and Index Setup
 3. Read the current champion from `best_result.txt` and treat its `elastic_index` value as the baseline Elasticsearch index for this experiment. If `best_result.txt` is uninitialized or lacks `elastic_index`, fall back to `mtrag`.
 4. Set environment variables:
    - `N=30`
-5. Keep the hypothesis slug short, lowercase, and stable so the branch name, index name, and artifact path all match.
+5. Keep the hypothesis slug short, lowercase, and stable so the branch name and index name match.
 
 Implementation Rules
 0. Before coding, complete the required research pass: read the cited paper/source and google/web-search practical implementation approaches for the technique.
@@ -75,7 +75,7 @@ Ingestion Rules
 Evaluation Protocol
 1. Run exactly one HotpotQA evaluation with `N=30`.
 2. Do not run MT-RAG or any other evaluator unless the planner explicitly asked for it.
-3. Save the HotpotQA output artifact under `artifacts/<hypothesis_slug>/` and record the HotpotQA metrics and artifact path in `results.csv`.
+3. Do not save any output artifacts to disk. Only record the HotpotQA metrics in `results.csv`.
 
 Recording Rules
 1. Append one row to `results.csv` for every evaluated hypothesis, including rejected runs.
@@ -97,7 +97,7 @@ Recording Rules
    - `hotpot_joint_f1`
    - `hotpot_wall_clock_s`
    - token and cost columns
-   - `hotpot_artifact_path`
+   - `hotpot_artifact_path` (leave blank — artifacts are no longer saved)
    - `notes`
 3. Leave benchmark columns blank only if the benchmark could not run (e.g. a failure before reaching it).
 4. In `notes`, include:
@@ -141,7 +141,7 @@ Champion File
 
 Cleanup
 1. After recording results, clean up rejected branches and if created a new es index - also delete it.
-2. Keep accepted artifacts long enough to audit the promotion decision.
+2. Do not save artifacts to disk.
 3. If `develop` changed materially during the experiment, restart the hypothesis from the updated `develop`.
 
 Runner Completion Rule

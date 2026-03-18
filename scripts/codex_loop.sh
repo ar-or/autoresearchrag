@@ -22,6 +22,11 @@ ITERATION=0
 cleanup() { rm -f "$LAST_MSG"; }
 trap cleanup EXIT
 
+# Control messages with background color
+info()  { printf '\033[44;97m %s \033[0m\n' "$*"; }  # white on blue
+ok()    { printf '\033[42;97m %s \033[0m\n' "$*"; }   # white on green
+err()   { printf '\033[41;97m %s \033[0m\n' "$*"; }   # white on red
+
 # Stream codex --json events in real-time, showing agent messages and commands.
 # Captures the last agent message to LAST_MSG for the done check.
 stream_and_capture() {
@@ -56,26 +61,26 @@ run_codex() {
     "$@" 2>>"$ERRLOG" | stream_and_capture
 }
 
-echo "stderr → $ERRLOG"
-echo "=== codex loop (max $MAX_ITERATIONS iterations) ==="
-echo "--- Iteration $((++ITERATION)) (initial) ---"
+info "stderr → $ERRLOG"
+info "codex loop (max $MAX_ITERATIONS iterations)"
+info "Iteration $((++ITERATION)) (initial)"
 
 run_codex codex exec --json -s danger-full-access "$INITIAL_PROMPT"
 
 while true; do
     if [ -f "$LAST_MSG" ] && grep -qi "$DONE_MARKER" "$LAST_MSG"; then
         echo ""
-        echo "=== Done after $ITERATION iteration(s) ==="
+        ok "Done after $ITERATION iteration(s)"
         break
     fi
 
     if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
         echo ""
-        echo "=== Hit max iterations ($MAX_ITERATIONS) ==="
+        err "Hit max iterations ($MAX_ITERATIONS)"
         exit 1
     fi
 
     echo ""
-    echo "--- Iteration $((++ITERATION)) (resume) ---"
+    info "Iteration $((++ITERATION)) (resume)"
     run_codex codex exec resume --last --json -o "$LAST_MSG" "$CONTINUE_MSG"
 done
