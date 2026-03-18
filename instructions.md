@@ -12,33 +12,16 @@ Primary Loop
 3. For each hypothesis, check `results.csv` to see whether that exact hypothesis card was already tested previously.
 4. Use the backlog card's stable `id` as the primary key for that check. Treat a hypothesis as already tested if any existing `results.csv` row has that same `hypothesis id=<card id>` recorded in `notes`.
 5. If the hypothesis was already tested previously, skip it and move to the next one. Do not spawn a duplicate sub-agent run for the same hypothesis id.
-6. If the hypothesis has not been evaluated yet, spawn a new sub-agent for that hypothesis.
-7. Wait for that sub-agent to finish fully before moving to the next hypothesis.
+6. If the hypothesis has not been evaluated yet, follow the execution mission instructions on implementation.
 8. After the sub-agent finishes, refresh your view of:
    - `develop`
    - `results.csv`
    - `best_result.txt`
 9. Then continue to the next hypothesis in `hypothesis_backlog.md`.
 
-Execution Rules For The Runner
-1. Process hypotheses sequentially. Do not run multiple hypotheses in parallel.
-2. Use a brand-new sub-agent for each hypothesis. Do not reuse the same sub-agent across multiple hypotheses.
-3. Pass only one hypothesis card to each sub-agent.
-4. Do not let a sub-agent invent a new hypothesis or combine multiple cards.
-5. The backlog order is the execution order unless the planner provided an explicit reordered list.
-6. If the planner provided a reordered list, still execute one hypothesis at a time and still use a fresh sub-agent per hypothesis.
 
-What The Runner Must Pass To Each Sub-Agent
-- The full hypothesis card.
-- The path to `hypothesis_backlog.md`.
-- The path to `results.csv`.
-- The path to `best_result.txt`.
-- The instruction that `develop` is the current baseline branch.
-- The instruction that the current baseline Elasticsearch index is the champion's `elastic_index` recorded in `best_result.txt`.
-- The instruction that the sub-agent owns both executor and judge responsibilities for that one hypothesis.
-- The instruction that before making code changes, the sub-agent must read the paper or source link referenced in the hypothesis card and also google/web-search the technique plus implementation approaches.
-
-Sub-Agent Mission
+Executioner Mission
+- switch to a new branch (see branch setup)
 - Execute exactly one hypothesis.
 - Read the linked paper/source for that hypothesis card before implementing it.
 - Google/web-search how the technique is typically implemented before choosing the minimal repo-specific change.
@@ -49,7 +32,6 @@ Sub-Agent Mission
 - If the hypothesis wins, update `best_result.txt` and merge the code into `develop`.
 - If it loses, do not merge the code into `develop`.
 
-Mandatory Rules The Runner Must Give To The Sub-Agent
 
 Research Rules
 - Before writing code, read the paper or source link referenced in the hypothesis card's implementation sketch. If the card has multiple relevant source links, read the ones needed to understand the specific technique being tested.
