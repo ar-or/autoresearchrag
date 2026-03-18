@@ -32,6 +32,8 @@ from hotpot_evaluate_v1 import update_answer, update_sp
 # ---------------------------------------------------------------------------
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "hotpot_dev_distractor_v1.json"
+DATA_ROOT = Path(__file__).resolve().parent.parent.parent / "data_as_files" / "hotpotqa"
+SKIP_N = int(os.environ.get("SKIP_N", "0"))
 NUM_EXAMPLES = int(os.environ.get("N", "20"))
 PARALLELISM = int(os.environ.get("PARALLELISM", "32"))
 
@@ -47,8 +49,33 @@ def build_prompt(example: dict) -> str:
     return (
         f"{question}\n\n"
         "Respond with ONLY a JSON object (no markdown, no explanation):\n"
-        '{"answer": "<your answer>", "supporting_facts": [["<title>", <sentence_index>], ...]}'
+        '{"answer": "...", "supporting_facts": [["title", "exact sentence text"], ...]}\n'
+        "Rules:\n"
+        "- Answer: short but complete. Never a full sentence.\n"
+        "- For yes/no questions, answer ONLY 'yes' or 'no'.\n"
+        "- supporting_facts: list EVERY sentence from the documents that is part of the reasoning chain. "
+        "Include each sentence as a separate entry even when multiple come from the same document. "
+        "Err on the side of including more rather than fewer.\n"
     )
+
+
+def _resolve_sentence_index(title: str, sentence_text: str) -> int:
+    """Look up the 0-based sentence index by matching text against the file lines."""
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(". ") or "_"
+    filepath = DATA_ROOT / f"{safe_name}.txt"
+    if not filepath.exists():
+        return -1
+    lines = filepath.read_text().splitlines()
+    # Normalize whitespace for comparison
+    needle = " ".join(sentence_text.split())
+    for i, line in enumerate(lines):
+        if needle == " ".join(line.split()):
+            return i
+        # Fuzzy: check if either contains the other
+        norm_line = " ".join(line.split())
+        if needle in norm_line or norm_line in needle:
+            return i
+    return -1
 
 
 def parse_response(text: str) -> tuple[str, list[list]]:
@@ -72,7 +99,10 @@ def parse_response(text: str) -> tuple[str, list[list]]:
                     title = title.rsplit("/", 1)[-1]
                 if title.endswith(".txt"):
                     title = title[:-4]
-                cleaned_sp.append([title, int(item[1])])
+                sentence_text = str(item[1])
+                idx = _resolve_sentence_index(title, sentence_text)
+                if idx >= 0:
+                    cleaned_sp.append([title, idx])
         return answer, cleaned_sp
     except (json.JSONDecodeError, ValueError, TypeError):
         return text.strip(), []
@@ -132,10 +162,13 @@ async def evaluate_one(
     cost_calc = CostCalculator(model)
     q_cost = cost_calc.cost(q_input, q_cached, q_output)
 
+    gold_sp = ex.get("supporting_facts", [])
     print(
         f"  [{idx+1}/{total}] {elapsed:.1f}s  answer={answer[:80]}  sp={len(sp)}  "
         f"tokens={q_input}/{q_cached}/{q_output}  cost=${q_cost:.6f}  {ex['question'][:60]}"
     )
+    print(f"    Predicted SP: {json.dumps(sp, indent=2)}")
+    print(f"    Gold SP:      {json.dumps(gold_sp, indent=2)}")
 
     return {
         "qid": qid,
@@ -166,7 +199,7 @@ async def async_main():
     with open(DATA_PATH) as f:
         data = json.load(f)
 
-    examples = data[:NUM_EXAMPLES]
+    examples = data[SKIP_N:SKIP_N + NUM_EXAMPLES]
     n = len(examples)
     print(f"Evaluating {n} examples  mode={mode}  (parallelism={PARALLELISM})\n")
 

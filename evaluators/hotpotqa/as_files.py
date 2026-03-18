@@ -34,7 +34,7 @@ def as_files(output_dir: Path):
     for ex in data:
         for title, sentences in ex["context"]:
             if title not in paragraphs:
-                paragraphs[title] = " ".join(sentences)
+                paragraphs[title] = "\n".join(sentences)
 
     written = 0
     skipped = 0

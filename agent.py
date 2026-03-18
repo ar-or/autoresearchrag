@@ -519,7 +519,9 @@ async def _run_agent(
     """Run the agent: retrieve, augment, call LLM with tool loop."""
 
     # 1. Pre-retrieval (always retrieve before agent runs)
+    print(f"    [search] {user_message[:200]}")
     contexts = await retrieve(user_message)
+    print(f"    [results] {len(contexts)} hits: {[c.title for c in contexts]}")
 
     # 2. Augment user message with retrieved context
     augmented = user_message
@@ -568,9 +570,12 @@ async def _run_agent(
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
             latest_batch: list[RetrievedContext] = []
             for tc in choice.message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                print(f"    [tool_call] {tc.function.name}({tc.function.arguments})")
                 tool_output, tool_contexts = await _handle_tool_call(
                     tc.function.name, tc.function.arguments
                 )
+                print(f"    [results] {len(tool_contexts)} hits: {[c.title for c in tool_contexts]}")
                 contexts.extend(tool_contexts)
                 latest_batch.extend(tool_contexts)
                 messages.append(
@@ -593,6 +598,7 @@ async def _run_agent(
 
         # Done — extract content
         content = choice.message.content or ""
+        print(f"    [answer] {content[:200]}")
         return content, contexts, usage
 
     # Fell through max iterations — return last content

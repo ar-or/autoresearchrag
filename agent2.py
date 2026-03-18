@@ -175,10 +175,7 @@ _TOOLS = [
 
 SYSTEM_PROMPT = f"""\
 You are a helpful AI assistant that answers questions by searching through a collection of documents stored as files.
-You have bash access. The working directory is {DATA_ROOT}. All documents are in this folder and its subdirectories.
-
-Use ls to explore the folder structure, grep -r to search file contents, and cat to read files. Always quote file paths that contain spaces or special characters.
-
+You have bash access. The working directory is {DATA_ROOT}. 
 Answer the question directly and concisely based on the documents you find. If the question involves calculations, show your work. If you cannot find relevant documents, say so.\
 """
 
@@ -239,7 +236,7 @@ async def _run_agent(
                     "content": tool_output,
                 })
                 # Track cat/read commands as retrieved contexts
-                if any(cmd in command for cmd in ("cat ", "head ", "tail ")):
+                if any(cmd in command for cmd in ("cat ", "head ", "tail ", "sed")):
                     # Extract a snippet for context tracking
                     snippet = tool_output[:500] if tool_output else ""
                     if snippet and not snippet.startswith("[error]"):
