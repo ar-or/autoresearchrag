@@ -1,8 +1,8 @@
 #!/bin/bash
 # codex_loop.sh — Run codex in a loop, auto-continuing until the agent says "all done"
 #
-# Uses `codex exec resume --last` so every iteration has the full conversation context.
-# Uses `codex exec` (non-interactive) so it exits after each turn.
+# Uses `codex exec --json` to stream events in real-time.
+# Uses `codex exec resume --last` to preserve full conversation context.
 #
 # Usage:
 #   ./scripts/codex_loop.sh "Evaluate hypothesis H1 first, then proceed to the rest"
@@ -22,12 +22,45 @@ ITERATION=0
 cleanup() { rm -f "$LAST_MSG"; }
 trap cleanup EXIT
 
-echo "stderr redirected to $ERRLOG"
+# Stream codex --json events in real-time, showing agent messages and commands.
+# Captures the last agent message to LAST_MSG for the done check.
+stream_and_capture() {
+    > "$LAST_MSG"
+    while IFS= read -r line; do
+        type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+        if [ "$type" = "item.completed" ]; then
+            item_type=$(echo "$line" | jq -r '.item.type // empty' 2>/dev/null)
+            if [ "$item_type" = "agent_message" ]; then
+                text=$(echo "$line" | jq -r '.item.text // empty' 2>/dev/null)
+                echo "$text"
+                echo "$text" > "$LAST_MSG"
+            elif [ "$item_type" = "command_execution" ]; then
+                cmd=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null)
+                output=$(echo "$line" | jq -r '.item.aggregated_output // empty' 2>/dev/null)
+                exit_code=$(echo "$line" | jq -r '.item.exit_code // empty' 2>/dev/null)
+                echo "  > $cmd"
+                [ -n "$output" ] && echo "$output" | head -20
+                [ "$exit_code" != "0" ] && [ "$exit_code" != "null" ] && echo "  [exit $exit_code]"
+            fi
+        elif [ "$type" = "item.started" ]; then
+            item_type=$(echo "$line" | jq -r '.item.type // empty' 2>/dev/null)
+            if [ "$item_type" = "command_execution" ]; then
+                cmd=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null)
+                echo "  [running] $cmd"
+            fi
+        fi
+    done
+}
 
+run_codex() {
+    "$@" 2>>"$ERRLOG" | stream_and_capture
+}
+
+echo "stderr → $ERRLOG"
 echo "=== codex loop (max $MAX_ITERATIONS iterations) ==="
 echo "--- Iteration $((++ITERATION)) (initial) ---"
 
-codex exec -s danger-full-access -o "$LAST_MSG" "$INITIAL_PROMPT" 2>>"$ERRLOG"
+run_codex codex exec --json -s danger-full-access "$INITIAL_PROMPT"
 
 while true; do
     if [ -f "$LAST_MSG" ] && grep -qi "$DONE_MARKER" "$LAST_MSG"; then
@@ -44,5 +77,5 @@ while true; do
 
     echo ""
     echo "--- Iteration $((++ITERATION)) (resume) ---"
-    codex exec resume --last -o "$LAST_MSG" "$CONTINUE_MSG" 2>>"$ERRLOG"
+    run_codex codex exec resume --last --json -o "$LAST_MSG" "$CONTINUE_MSG"
 done
