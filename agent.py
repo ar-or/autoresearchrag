@@ -31,7 +31,7 @@ MODEL: str = os.environ.get("ORAGENT_MODEL", "gpt-5-mini")
 SYSTEM_PROMPT: str = os.environ.get(
     "ORAGENT_SYSTEM_PROMPT", "You are a helpful AI assistant."
 )
-ELASTIC_URL: str = os.environ.get("ELASTIC_URL", "http://localhost:9200")
+ELASTIC_URL: str = os.environ.get("ES_HOST", "http://localhost:9200")
 ELASTIC_API_KEY: str = os.environ.get("ELASTIC_API_KEY", "")
 ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))

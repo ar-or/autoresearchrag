@@ -8,6 +8,12 @@ services:
       - discovery.type=single-node
       - xpack.security.enabled=false
       - xpack.security.http.ssl.enabled=false
+      - network.host=0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     volumes:
       - esdata:/usr/share/elasticsearch/data
 
@@ -18,7 +24,8 @@ services:
     stdin_open: true
     tty: true
     depends_on:
-      - elastic
+      elastic:
+        condition: service_healthy
     environment:
       - ORAGENT_URL=http://localhost:32522
       - ELASTIC_URL=http://localhost:9200

@@ -31,7 +31,7 @@ import requests
 
 from scripts.embedder import EMBED_DIMS, embed_batch
 
-ELASTIC_URL = os.environ.get("ELASTIC_URL", "http://localhost:9200")
+ELASTIC_URL = os.environ.get("ES_HOST", "http://localhost:9200")
 ELASTIC_INDEX = os.environ.get("ES_INDEX", "mtrag")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "64"))
