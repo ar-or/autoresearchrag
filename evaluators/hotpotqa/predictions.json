@@ -1,19 +1,19 @@
 {
   "answer": {
     "5a8b57f25542995d1e6f1371": "yes",
-    "5a8c7595554299585d9e36b6": "United States ambassador to Ghana",
-    "5a85ea095542994775f606a8": "",
+    "5a8c7595554299585d9e36b6": "United States ambassador to Ghana and to Czechoslovakia; Chief of Protocol of the United States",
+    "5a85ea095542994775f606a8": "Animorphs",
     "5adbf0a255429947ff17385a": "no",
-    "5a8e3ea95542995a26add48d": "Greenwich Village, New York City"
+    "5a8e3ea95542995a26add48d": "New York City"
   },
   "sp": {
     "5a8b57f25542995d1e6f1371": [
       [
-        "Scott Derrickson",
+        "Ed Wood",
         0
       ],
       [
-        "Ed Wood",
+        "Scott Derrickson",
         0
       ]
     ],
@@ -27,14 +27,27 @@
         1
       ]
     ],
-    "5a85ea095542994775f606a8": [],
-    "5adbf0a255429947ff17385a": [
+    "5a85ea095542994775f606a8": [
       [
-        "Laleli Mosque",
+        "Animorphs",
         0
       ],
       [
+        "Animorphs",
+        1
+      ],
+      [
+        "Animorphs",
+        2
+      ]
+    ],
+    "5adbf0a255429947ff17385a": [
+      [
         "Esma Sultan Mansion",
+        0
+      ],
+      [
+        "Laleli Mosque",
         0
       ]
     ],
@@ -44,7 +57,7 @@
         0
       ],
       [
-        "Adriana Trigiani",
+        "Fader Label",
         0
       ]
     ]

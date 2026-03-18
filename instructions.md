@@ -43,7 +43,7 @@ Sub-Agent Mission
 - Read the linked paper/source for that hypothesis card before implementing it.
 - Google/web-search how the technique is typically implemented before choosing the minimal repo-specific change.
 - Implement the hypothesis.
-- Evaluate it on both FinQA with `N=30` and HotpotQA with `N=30`.
+- Evaluate it on HotpotQA with `N=30`.
 - Judge it against the current champion in `best_result.txt`.
 - Record the result in `results.csv`.
 - If the hypothesis wins, update `best_result.txt` and merge the code into `develop`.
@@ -61,7 +61,6 @@ Research Rules
 Scope and Constraints
 - One hypothesis per run. Do not bundle multiple unrelated ideas into one experiment.
 - Default editable files are `agent.py` and `scripts/ingest.py`.
-- If the hypothesis is specifically about FinQA document rendering, `evaluators/finqa/ingest_finqa.py` may also be changed.
 - Do not change evaluator scoring logic.
 - Do not change the embedding model.
 - Do not remove, bypass, or replace the sqlite embedding cache.
@@ -87,18 +86,14 @@ Ingestion Rules
    - Clone the current champion Elasticsearch index from `best_result.txt` into `feature_<hypothesis_slug>`. If no champion index is recorded yet, clone `mtrag`.
    - Set environment variable `ES_INDEX=feature_<hypothesis_slug>`
    - delete all documents in the newly created `ES_INDEX` where `collection_name=mycollection1`
-   - reingest FinQA with `uv run python evaluators/finqa/ingest_finqa.py`
    - reingest HotpotQA with `uv run python evaluators/hotpotqa/ingest_hotpotqa.py`
 2. Unless ingestion, chunking, embedding, or document serialization changed, do not create a new Elasticsearch index. Instead, set `ES_INDEX` to the champion's `elastic_index` from `best_result.txt` and operate on the documents that already exist there.
 3. If chunk count explodes or collapses unexpectedly after an ingestion change, stop and record the run as rejected with the reason in `notes`.
 
 Evaluation Protocol
-1. Run exactly one FinQA evaluation with `N=30`.
-2. Run exactly one HotpotQA evaluation with `N=30`.
-3. Both benchmarks are always required. Do not skip either one.
-4. Do not run MT-RAG or any other evaluator unless the planner explicitly asked for it.
-5. Save the FinQA output artifact under `artifacts/<hypothesis_slug>/` and record the artifact path in `results.csv`.
-6. Save the HotpotQA output artifact under `artifacts/<hypothesis_slug>/` and record the HotpotQA metrics and artifact path in `results.csv`.
+1. Run exactly one HotpotQA evaluation with `N=30`.
+2. Do not run MT-RAG or any other evaluator unless the planner explicitly asked for it.
+3. Save the HotpotQA output artifact under `artifacts/<hypothesis_slug>/` and record the HotpotQA metrics and artifact path in `results.csv`.
 
 Recording Rules
 1. Append one row to `results.csv` for every evaluated hypothesis, including rejected runs.
@@ -109,16 +104,6 @@ Recording Rules
    - `elastic_index`
    - `retrieval_k`
    - `agent_mode`
-   - `finqa_n`
-   - `finqa_parallelism`
-   - `finqa_ok`
-   - `finqa_accuracy`
-   - `finqa_correct`
-   - `finqa_wall_clock_s`
-   - token and cost columns
-   - `finqa_artifact_path`
-   - `notes`
-3. Always also record HotpotQA results:
    - `hotpot_n`
    - `hotpot_parallelism`
    - `hotpot_ok`
@@ -131,8 +116,9 @@ Recording Rules
    - `hotpot_wall_clock_s`
    - token and cost columns
    - `hotpot_artifact_path`
-4. Leave unrelated benchmark columns blank only if that benchmark could not run (e.g. a failure before reaching it).
-5. In `notes`, include:
+   - `notes`
+3. Leave benchmark columns blank only if the benchmark could not run (e.g. a failure before reaching it).
+4. In `notes`, include:
    - hypothesis id
    - changed files
    - `reingest=yes` or `reingest=no`
@@ -140,23 +126,19 @@ Recording Rules
    - final judge decision
 
 Judge Rules
-1. Compare the experiment to the current champion in `best_result.txt` on both FinQA accuracy and HotpotQA answer_f1.
+1. Compare the experiment to the current champion in `best_result.txt` on HotpotQA answer_f1 (primary metric) and joint_f1 (tiebreaker).
 2. Possible decisions are:
    - `rejected`
    - `promoted`
 3. Reject the experiment if any of the following is true:
-   - either benchmark run failed
+   - the benchmark run failed
    - the change cannot be attributed to a single hypothesis
    - cost or latency increased materially without meaningful accuracy gain
-4. Compute the net improvement across both benchmarks:
-   - `finqa_delta = challenger_finqa_accuracy − champion_finqa_accuracy`
-   - `hotpot_delta = challenger_hotpot_answer_f1 − champion_hotpot_answer_f1`
-5. Promotion rule based on net improvement:
-   - If both deltas are >= 0 and at least one is > 0: **promote**.
-   - If both deltas are < 0: **reject**.
-   - If the deltas have mixed signs: promote only if the magnitude of the improvement on one benchmark strictly exceeds the magnitude of the decline on the other (i.e. `abs(positive_delta) > abs(negative_delta)`). Otherwise **reject**.
-   - If both deltas are exactly 0: **reject** (pure tie).
-6. Additionally, promote only if the win is explainable:
+4. Promotion rule:
+   - If `challenger_hotpot_answer_f1 > champion_hotpot_answer_f1`: **promote**.
+   - If `challenger_hotpot_answer_f1 < champion_hotpot_answer_f1`: **reject**.
+   - If `challenger_hotpot_answer_f1 == champion_hotpot_answer_f1` (tie): promote only if `challenger_hotpot_joint_f1 > champion_hotpot_joint_f1`. Otherwise **reject**.
+5. Additionally, promote only if the win is explainable:
    - the result is explainable from the hypothesis
    - the cost increase is acceptable for the gain
 
@@ -172,8 +154,8 @@ Merge Rules
 Champion File
 - `best_result.txt` is the single source of truth for the current champion.
 - `best_result.txt` must include the champion's `elastic_index`, and that value is the default `ES_INDEX` baseline for the next experiment.
-- `best_result.txt` must always include the champion's HotpotQA metrics (since both benchmarks are always run).
-- If `best_result.txt` is uninitialized, the first successful `N=30` FinQA run accepted on `develop` becomes the initial champion.
+- `best_result.txt` must always include the champion's HotpotQA metrics.
+- If `best_result.txt` is uninitialized, the first successful `N=30` HotpotQA run accepted on `develop` becomes the initial champion.
 
 Cleanup
 1. After recording results, clean up rejected branches and if created a new es index - also delete it.
@@ -187,7 +169,6 @@ Per-Hypothesis Completion Rule
 - A sub-agent is done only when all of the following are true:
   - exactly one hypothesis was executed
   - code changes are committed on the experiment branch
-  - FinQA evaluation completed or failed cleanly
   - HotpotQA evaluation completed or failed cleanly
   - a row was appended to `results.csv`
   - a judge decision was made
