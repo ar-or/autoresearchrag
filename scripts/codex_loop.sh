@@ -1,8 +1,8 @@
 #!/bin/bash
 # codex_loop.sh — Run codex in a loop, auto-continuing until the agent says "all done"
 #
-# Uses `codex resume --last` so every iteration has the full conversation context.
-# Uses --no-alt-screen so output stays in your terminal scrollback.
+# Uses `codex exec resume --last` so every iteration has the full conversation context.
+# Uses `codex exec` (non-interactive) so it exits after each turn.
 #
 # Usage:
 #   ./scripts/codex_loop.sh "Evaluate hypothesis H1 first, then proceed to the rest"
@@ -15,28 +15,22 @@ CONTINUE_MSG="Proceed in evaluating all hypotheses until the last one is done. W
 DONE_MARKER="all done"
 MAX_ITERATIONS="${MAX_ITERATIONS:-50}"
 INITIAL_PROMPT="${1:-$CONTINUE_MSG}"
+LAST_MSG="/tmp/codex_last_msg_$$.txt"
+ERRLOG="/tmp/codex_loop_errors_$$.log"
 ITERATION=0
 
-# Find the latest session JSONL
-latest_session_file() {
-    find ~/.codex/sessions -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
-        | sort -rn | head -1 | cut -d' ' -f2-
-}
+cleanup() { rm -f "$LAST_MSG"; }
+trap cleanup EXIT
 
-# Check if the session transcript contains the done marker
-check_done() {
-    local f="$1"
-    [ -f "$f" ] || return 1
-    tail -50 "$f" | grep -qi "$DONE_MARKER"
-}
+echo "stderr redirected to $ERRLOG"
 
 echo "=== codex loop (max $MAX_ITERATIONS iterations) ==="
 echo "--- Iteration $((++ITERATION)) (initial) ---"
 
-codex --no-alt-screen -s danger-full-access -a never "$INITIAL_PROMPT"
+codex exec -s danger-full-access -o "$LAST_MSG" "$INITIAL_PROMPT" 2>>"$ERRLOG"
 
 while true; do
-    if check_done "$(latest_session_file)"; then
+    if [ -f "$LAST_MSG" ] && grep -qi "$DONE_MARKER" "$LAST_MSG"; then
         echo ""
         echo "=== Done after $ITERATION iteration(s) ==="
         break
@@ -50,5 +44,5 @@ while true; do
 
     echo ""
     echo "--- Iteration $((++ITERATION)) (resume) ---"
-    codex resume --last --no-alt-screen -s danger-full-access -a never "$CONTINUE_MSG"
+    codex exec resume --last -o "$LAST_MSG" "$CONTINUE_MSG" 2>>"$ERRLOG"
 done
