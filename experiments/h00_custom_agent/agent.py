@@ -14,15 +14,27 @@ import asyncio
 import json
 import os
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
 from openai import AsyncOpenAI
+
+from agent_base import (
+    RetrievedContext,
+    ChatMessage,
+    TokenUsage,
+    SendMessageResult,
+    Session,
+    create_session,
+    get_session,
+    _add_message,
+    _sessions,
+)
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -31,82 +43,10 @@ from openai import AsyncOpenAI
 MODEL: str = os.environ.get("ORAGENT_MODEL", "gpt-5-mini")
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
 _MNT_DATA = Path("/mnt/data")
-DATA_ROOT: Path = _MNT_DATA if _MNT_DATA.is_dir() else Path(__file__).resolve().parent / "data_as_files"
+DATA_ROOT: Path = _MNT_DATA if _MNT_DATA.is_dir() else _PROJECT_ROOT / "data_as_files"
 BASH_TIMEOUT_S: int = 30  # max seconds per bash invocation
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
-
-# ---------------------------------------------------------------------------
-# Types (same as agent.py for evaluator compatibility)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RetrievedContext:
-    document_id: str
-    text: str
-    title: str
-    score: float
-
-
-@dataclass
-class ChatMessage:
-    role: Literal["user", "assistant"]
-    content: str
-    timestamp: str = ""
-    contexts: list[RetrievedContext] = field(default_factory=list)
-
-
-@dataclass
-class TokenUsage:
-    input_tokens: int = 0
-    cached_tokens: int = 0
-    output_tokens: int = 0
-
-
-@dataclass
-class SendMessageResult:
-    session_id: str
-    response: str
-    contexts: list[RetrievedContext]
-    model: str
-    usage: TokenUsage
-
-
-@dataclass
-class Session:
-    id: str
-    messages: list[ChatMessage]
-    created_at: str
-    updated_at: str
-
-
-# ---------------------------------------------------------------------------
-# In-memory session store
-# ---------------------------------------------------------------------------
-
-_sessions: dict[str, Session] = {}
-
-
-def create_session() -> str:
-    from datetime import datetime, timezone
-
-    sid = os.urandom(16).hex()
-    now = datetime.now(timezone.utc).isoformat()
-    _sessions[sid] = Session(id=sid, messages=[], created_at=now, updated_at=now)
-    return sid
-
-
-def get_session(session_id: str) -> Session | None:
-    return _sessions.get(session_id)
-
-
-def _add_message(session_id: str, msg: ChatMessage) -> None:
-    from datetime import datetime, timezone
-
-    session = _sessions[session_id]
-    session.messages.append(msg)
-    session.updated_at = datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +115,7 @@ _TOOLS = [
 
 SYSTEM_PROMPT = f"""\
 You are a helpful AI assistant that answers questions by searching through a collection of documents stored as files.
-You have bash access. The working directory is {DATA_ROOT}. 
+You have bash access. The working directory is {DATA_ROOT}.
 Answer the question directly and concisely based on the documents you find. If the question involves calculations, show your work. If you cannot find relevant documents, say so.\
 """
 
