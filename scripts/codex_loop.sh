@@ -20,6 +20,8 @@ ERRLOG="/tmp/codex_loop_errors_$$.log"
 ITERATION=0
 
 cleanup() { rm -f "$LAST_MSG"; }
+abort()  { echo ""; err "Interrupted"; cleanup; kill 0; }
+trap abort INT TERM
 trap cleanup EXIT
 
 # Control messages with background color
@@ -76,5 +78,5 @@ while true; do
 
     echo ""
     info "Iteration $((++ITERATION)) (resume)"
-    run_codex codex exec resume --last --json -o "$LAST_MSG" "$CONTINUE_MSG"
+    run_codex codex exec resume --last --json --dangerously-bypass-approvals-and-sandbox -o "$LAST_MSG" "$CONTINUE_MSG"
 done
