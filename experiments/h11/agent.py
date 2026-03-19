@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -35,6 +36,7 @@ ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
 ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
+QPP_GATE_THRESHOLD: float = float(os.environ.get("QPP_GATE_THRESHOLD", "0.08"))
 EMBED_MODEL: str = "text-embedding-3-small"
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
@@ -199,63 +201,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +216,28 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _score_dispersion_qpp(hits: list[dict[str, Any]], max_items: int = 5) -> float:
+    scores = [
+        float(hit.get("_score", 0.0) or 0.0)
+        for hit in hits[:max_items]
+        if float(hit.get("_score", 0.0) or 0.0) > 0
+    ]
+    if len(scores) < 2:
+        return 0.0
+    top_score = max(abs(scores[0]), 1e-9)
+    normalized_scores = [score / top_score for score in scores]
+    return statistics.pstdev(normalized_scores)
+
+
+def _passes_qpp_gate(
+    vector_hits: list[dict[str, Any]],
+    text_hits: list[dict[str, Any]],
+) -> bool:
+    vector_qpp = _score_dispersion_qpp(vector_hits)
+    text_qpp = _score_dispersion_qpp(text_hits)
+    return max(vector_qpp, text_qpp) >= QPP_GATE_THRESHOLD
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -278,13 +245,16 @@ async def retrieve(
 ) -> list[RetrievedContext]:
     idx = index or ELASTIC_INDEX
     top_k = k or RETRIEVAL_K
+    if not query.strip():
+        return _hits_to_contexts(_es_text_search(idx, "", top_k))
     try:
         vector = (await asyncio.to_thread(embed_batch, [query]))[0]
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        if not _passes_qpp_gate(vector_hits, text_hits):
+            return []
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)

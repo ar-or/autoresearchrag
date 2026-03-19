@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -82,6 +84,14 @@ class Session:
     messages: list[ChatMessage]
     created_at: str
     updated_at: str
+
+
+@dataclass
+class RetrievalTraceStep:
+    coverage: float
+    supportive_contexts: int
+    novelty_ratio: float
+    gain: float
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +180,47 @@ def _es_text_search(
     return r.json().get("hits", {}).get("hits", [])
 
 
+def _keyword_query_string(query: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.&/-]{2,}", query)
+    filtered = [
+        token
+        for token in tokens
+        if token.lower() not in {"what", "which", "when", "where", "were", "with", "from", "that", "this"}
+    ]
+    return " ".join(filtered[:8]) or query
+
+
+def _should_use_keyword_search(query: str) -> bool:
+    tokens = re.findall(r"[A-Za-z0-9.&/-]+", query)
+    has_acronym = any(token.isupper() and len(token) >= 2 for token in tokens)
+    has_numeric = any(any(ch.isdigit() for ch in token) for token in tokens)
+    has_entity_cue = any(token[:1].isupper() for token in tokens[1:])
+    return has_acronym or has_numeric or has_entity_cue
+
+
+def _es_keyword_search(index: str, query: str, k: int) -> list[dict[str, Any]]:
+    body = {
+        "size": k,
+        "query": {
+            "simple_query_string": {
+                "query": _keyword_query_string(query),
+                "fields": ["title^3", "text^2", "content^2"],
+                "default_operator": "and",
+            }
+        },
+        "_source": {"excludes": ["embedding"]},
+    }
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json=body,
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
 def _hit_identity(hit: dict[str, Any]) -> str:
     src = hit.get("_source", {})
     return (
@@ -199,63 +250,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +265,185 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "what",
+    "when",
+    "which",
+    "who",
+    "with",
+}
+
+
+def _query_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) >= 3 and token not in _STOPWORDS
+    }
+
+
+def _context_signature(context: RetrievedContext) -> tuple[str, str, str]:
+    return (context.document_id, context.title, context.text[:160])
+
+
+def _context_overlap(query_terms: set[str], context: RetrievedContext) -> int:
+    haystack = f"{context.title} {context.text}".lower()
+    return sum(1 for term in query_terms if term in haystack)
+
+
+def _query_complexity_bonus(query: str) -> float:
+    lowered = query.lower()
+    cues = (
+        "both",
+        "before",
+        "after",
+        "which other",
+        "same",
+        "different",
+        "compare",
+    )
+    return 0.15 if any(cue in lowered for cue in cues) else 0.0
+
+
+def _trace_step(
+    query: str,
+    contexts: list[RetrievedContext],
+    latest_batch: list[RetrievedContext],
+    previous_coverage: float,
+) -> RetrievalTraceStep:
+    query_terms = _query_terms(query)
+    if not query_terms or not contexts:
+        return RetrievalTraceStep(
+            coverage=0.0,
+            supportive_contexts=0,
+            novelty_ratio=0.0,
+            gain=0.0,
+        )
+
+    matched_terms: set[str] = set()
+    supportive_contexts = 0
+    for context in contexts:
+        overlap = _context_overlap(query_terms, context)
+        if overlap >= 2:
+            supportive_contexts += 1
+        haystack = f"{context.title} {context.text}".lower()
+        matched_terms.update(term for term in query_terms if term in haystack)
+
+    coverage = len(matched_terms) / max(len(query_terms), 1)
+    previous_signatures = {
+        _context_signature(context)
+        for context in contexts[:-len(latest_batch)]
+    } if latest_batch else set()
+    novel = sum(
+        1 for context in latest_batch if _context_signature(context) not in previous_signatures
+    )
+    novelty_ratio = novel / len(latest_batch) if latest_batch else 0.0
+    return RetrievalTraceStep(
+        coverage=coverage,
+        supportive_contexts=supportive_contexts,
+        novelty_ratio=novelty_ratio,
+        gain=max(coverage - previous_coverage, 0.0),
+    )
+
+
+def _should_continue_with_q_lambda_proxy(
+    query: str,
+    trace: list[RetrievalTraceStep],
+) -> bool:
+    if not trace:
+        return True
+    search_round = len(trace) - 1
+    if search_round >= 2:
+        return False
+
+    current = trace[-1]
+    complexity_bonus = _query_complexity_bonus(query)
+
+    continue_value = (
+        0.55 * (1.0 - current.coverage)
+        + 0.25 * current.gain
+        + 0.20 * current.novelty_ratio
+        + complexity_bonus
+        - 0.15 * search_round
+    )
+    stop_value = (
+        0.60 * current.coverage
+        + 0.20 * min(current.supportive_contexts / 2.0, 1.0)
+        + 0.20 * (1.0 - current.novelty_ratio if search_round > 0 else 0.0)
+    )
+    return continue_value > stop_value
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    a_norm = math.sqrt(sum(x * x for x in a))
+    b_norm = math.sqrt(sum(y * y for y in b))
+    if not a_norm or not b_norm:
+        return 0.0
+    return dot / (a_norm * b_norm)
+
+
+async def _sentence_rerank_contexts(
+    query: str,
+    contexts: list[RetrievedContext],
+    top_k: int,
+) -> list[RetrievedContext]:
+    if not contexts:
+        return contexts
+
+    query_vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+    sentence_texts: list[str] = []
+    sentence_to_context: list[int] = []
+    for index, context in enumerate(contexts):
+        for sentence in _split_sentences(context.text)[:6]:
+            sentence_texts.append(sentence)
+            sentence_to_context.append(index)
+    if not sentence_texts:
+        return contexts[:top_k]
+
+    sentence_vectors = await asyncio.to_thread(embed_batch, sentence_texts)
+    best_scores = [-1.0] * len(contexts)
+    for idx, vector in enumerate(sentence_vectors):
+        context_index = sentence_to_context[idx]
+        best_scores[context_index] = max(
+            best_scores[context_index],
+            _cosine_similarity(query_vector, vector),
+        )
+
+    ranked = sorted(
+        enumerate(contexts),
+        key=lambda item: (best_scores[item[0]], item[1].score),
+        reverse=True,
+    )
+    return [context for _, context in ranked[:top_k]]
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -283,14 +456,21 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        if _should_use_keyword_search(query):
+            keyword_hits = _es_keyword_search(idx, query, candidate_k)
+            hits = _fuse_hits_rrf(vector_hits, text_hits, keyword_hits, k=top_k)
+        else:
+            hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
         except Exception:
             return []
-    return _hits_to_contexts(hits)
+    contexts = _hits_to_contexts(hits)
+    try:
+        return await _sentence_rerank_contexts(query, contexts, top_k)
+    except Exception:
+        return contexts[:top_k]
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +544,18 @@ async def _run_agent(
     # 4. Agent loop (tool calling)
     usage = TokenUsage()
     max_iterations = 10
+    trace = [_trace_step(user_message, contexts, contexts, 0.0)]
+    allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
 
     for _ in range(max_iterations):
+        request_kwargs: dict[str, Any] = {
+            "model": MODEL,
+            "messages": messages,
+        }
+        if allow_search:
+            request_kwargs["tools"] = [_SEARCH_TOOL]
         resp = await _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
+            **request_kwargs,  # type: ignore[arg-type]
         )
         choice = resp.choices[0]
 
@@ -385,11 +571,13 @@ async def _run_agent(
         # If the model wants to call tools, execute them and continue
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
+            latest_batch: list[RetrievedContext] = []
             for tc in choice.message.tool_calls:
                 tool_output, tool_contexts = await _handle_tool_call(
                     tc.function.name, tc.function.arguments
                 )
                 contexts.extend(tool_contexts)
+                latest_batch.extend(tool_contexts)
                 messages.append(
                     {
                         "role": "tool",
@@ -397,6 +585,15 @@ async def _run_agent(
                         "content": tool_output,
                     }
                 )
+            trace.append(
+                _trace_step(
+                    user_message,
+                    contexts,
+                    latest_batch,
+                    trace[-1].coverage,
+                )
+            )
+            allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
             continue
 
         # Done — extract content

@@ -199,63 +199,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +214,32 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _normalize_context_text(text: str) -> str:
+    return " ".join(text.split()).strip().lower()
+
+
+def _compact_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+    compacted: list[RetrievedContext] = []
+    seen: set[str] = set()
+    for context in contexts:
+        normalized = _normalize_context_text(context.text)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        trimmed_text = context.text.strip()
+        if context.title and trimmed_text.startswith(context.title):
+            trimmed_text = trimmed_text[len(context.title):].lstrip(" :\n-")
+        compacted.append(
+            RetrievedContext(
+                document_id=context.document_id,
+                text=trimmed_text,
+                title=context.title,
+                score=context.score,
+            )
+        )
+    return compacted
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -283,8 +252,7 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
@@ -344,13 +312,13 @@ async def _run_agent(
     """Run the agent: retrieve, augment, call LLM with tool loop."""
 
     # 1. Pre-retrieval (always retrieve before agent runs)
-    contexts = await retrieve(user_message)
+    contexts = _compact_contexts(await retrieve(user_message))
 
     # 2. Augment user message with retrieved context
     augmented = user_message
     if contexts:
         block = "\n\n".join(
-            f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
+            f"[{i+1}] {c.document_id} {(c.title + ': ') if c.title else ''}{c.text}"
             for i, c in enumerate(contexts)
         )
         augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
@@ -389,7 +357,7 @@ async def _run_agent(
                 tool_output, tool_contexts = await _handle_tool_call(
                     tc.function.name, tc.function.arguments
                 )
-                contexts.extend(tool_contexts)
+                contexts = _compact_contexts(contexts + tool_contexts)
                 messages.append(
                     {
                         "role": "tool",

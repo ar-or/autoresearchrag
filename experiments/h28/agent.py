@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -199,61 +200,16 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
+def _fusion_profile(query: str) -> tuple[int, int]:
+    has_digits = any(ch.isdigit() for ch in query)
+    has_quoted_phrase = '"' in query or "'" in query
+    acronym_count = len(re.findall(r"\b[A-Z]{2,}\b", query))
+    lexical_heavy = has_digits or has_quoted_phrase or acronym_count > 0
+    if lexical_heavy:
+        return (1, 3)
+    if len(query.split()) <= 6:
+        return (2, 1)
+    return (1, 1)
 
 
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
@@ -283,8 +239,9 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        vector_weight, text_weight = _fusion_profile(query)
+        weighted_lists = [vector_hits] * vector_weight + [text_hits] * text_weight
+        hits = _fuse_hits_rrf(*weighted_lists, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)

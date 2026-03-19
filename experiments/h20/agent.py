@@ -199,63 +199,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -283,8 +226,7 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
@@ -311,6 +253,56 @@ _SEARCH_TOOL = {
         },
     },
 }
+
+
+async def _chat_once(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+):
+    return await _openai.chat.completions.create(
+        model=MODEL,
+        messages=messages,  # type: ignore[arg-type]
+        tools=tools,  # type: ignore[arg-type]
+    )
+
+
+def _usage_from_response(resp: Any) -> TokenUsage:
+    usage = TokenUsage()
+    if resp.usage:
+        usage.input_tokens += resp.usage.prompt_tokens
+        usage.output_tokens += resp.usage.completion_tokens
+        if hasattr(resp.usage, "prompt_tokens_details") and resp.usage.prompt_tokens_details:
+            usage.cached_tokens += getattr(
+                resp.usage.prompt_tokens_details, "cached_tokens", 0
+            ) or 0
+    return usage
+
+
+def _merge_usage(total: TokenUsage, delta: TokenUsage) -> None:
+    total.input_tokens += delta.input_tokens
+    total.cached_tokens += delta.cached_tokens
+    total.output_tokens += delta.output_tokens
+
+
+def _format_context_block(contexts: list[RetrievedContext]) -> str:
+    return "\n\n".join(
+        f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
+        for i, c in enumerate(contexts)
+    )
+
+
+def _dedupe_contexts(contexts: list[RetrievedContext], limit: int | None = None) -> list[RetrievedContext]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[RetrievedContext] = []
+    for context in contexts:
+        key = (context.document_id, context.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+        if limit is not None and len(deduped) >= limit:
+            break
+    return deduped
 
 
 async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[RetrievedContext]]:
@@ -349,10 +341,7 @@ async def _run_agent(
     # 2. Augment user message with retrieved context
     augmented = user_message
     if contexts:
-        block = "\n\n".join(
-            f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
-            for i, c in enumerate(contexts)
-        )
+        block = _format_context_block(contexts)
         augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
 
     # 3. Build message list
@@ -366,21 +355,9 @@ async def _run_agent(
     max_iterations = 10
 
     for _ in range(max_iterations):
-        resp = await _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
-        )
+        resp = await _chat_once(messages, [_SEARCH_TOOL])
         choice = resp.choices[0]
-
-        # Accumulate tokens
-        if resp.usage:
-            usage.input_tokens += resp.usage.prompt_tokens
-            usage.output_tokens += resp.usage.completion_tokens
-            if hasattr(resp.usage, "prompt_tokens_details") and resp.usage.prompt_tokens_details:
-                usage.cached_tokens += getattr(
-                    resp.usage.prompt_tokens_details, "cached_tokens", 0
-                ) or 0
+        _merge_usage(usage, _usage_from_response(resp))
 
         # If the model wants to call tools, execute them and continue
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
@@ -400,6 +377,22 @@ async def _run_agent(
             continue
 
         # Done — extract content
+        final_contexts = _dedupe_contexts(contexts, RETRIEVAL_K * 2)
+        if final_contexts:
+            final_prompt = (
+                "Use the accumulated retrieved evidence to answer the user's question.\n\n"
+                f"Retrieved documents:\n{_format_context_block(final_contexts)}\n\n"
+                f"User question: {user_message}"
+            )
+            final_resp = await _chat_once(
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": final_prompt},
+                ]
+            )
+            _merge_usage(usage, _usage_from_response(final_resp))
+            content = final_resp.choices[0].message.content or ""
+            return content, final_contexts, usage
         content = choice.message.content or ""
         return content, contexts, usage
 

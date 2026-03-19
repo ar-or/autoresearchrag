@@ -46,10 +46,12 @@ _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
 
 @dataclass
 class RetrievedContext:
+    lookup_id: str
     document_id: str
     text: str
     title: str
     score: float
+    chunk_index: int = 0
 
 
 @dataclass
@@ -82,6 +84,13 @@ class Session:
     messages: list[ChatMessage]
     created_at: str
     updated_at: str
+
+
+@dataclass
+class RetrievalState:
+    last_query: str = ""
+    search_results: dict[str, RetrievedContext] = field(default_factory=dict)
+    read_results: list[RetrievedContext] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -199,73 +208,18 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
         src = hit.get("_source", {})
         out.append(
             RetrievedContext(
+                lookup_id=_hit_identity(hit),
                 document_id=src.get("document_id") or src.get("id") or hit.get("_id", ""),
                 text=src.get("text") or src.get("content") or src.get("pageContent", ""),
                 title=src.get("title", ""),
                 score=hit.get("_score", 0),
+                chunk_index=int(src.get("chunk_index", 0) or 0),
             )
         )
     return out
@@ -283,8 +237,7 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
@@ -301,7 +254,7 @@ _SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "search_documents",
-        "description": "Search the knowledge base for relevant passages. Input should be a search query string.",
+        "description": "Search the knowledge base and return compact snippets plus lookup_ids. Use read_documents to open full chunks you want to inspect.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -312,23 +265,123 @@ _SEARCH_TOOL = {
     },
 }
 
+_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_documents",
+        "description": "Open one or more search results by lookup_id and optionally include adjacent chunks for local continuity.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "lookup_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lookup IDs returned by search_documents.",
+                },
+                "include_neighbors": {
+                    "type": "boolean",
+                    "description": "Whether to include adjacent chunks for each selected result.",
+                },
+            },
+            "required": ["lookup_ids"],
+        },
+    },
+}
 
-async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[RetrievedContext]]:
-    if name == "search_documents":
-        args = json.loads(arguments)
-        query = args.get("query", "")
-        results = await retrieve(query)
-        payload = [
+
+def _snippet(text: str, limit: int = 220) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _search_payload(contexts: list[RetrievedContext]) -> str:
+    return json.dumps(
+        [
             {
                 "rank": i + 1,
-                "document_id": r.document_id,
-                "title": r.title,
-                "text": r.text,
-                "score": r.score,
+                "lookup_id": context.lookup_id,
+                "document_id": context.document_id,
+                "title": context.title,
+                "snippet": _snippet(context.text),
+                "score": context.score,
             }
-            for i, r in enumerate(results)
+            for i, context in enumerate(contexts)
         ]
-        return json.dumps(payload), results
+    )
+
+
+def _read_payload(contexts: list[RetrievedContext]) -> str:
+    return json.dumps(
+        [
+            {
+                "rank": i + 1,
+                "lookup_id": context.lookup_id,
+                "document_id": context.document_id,
+                "title": context.title,
+                "chunk_index": context.chunk_index,
+                "text": context.text,
+                "score": context.score,
+            }
+            for i, context in enumerate(contexts)
+        ]
+    )
+
+
+def _es_chunk_neighbors(index: str, document_id: str, chunk_index: int) -> list[dict[str, Any]]:
+    target_indices = [chunk_index - 1, chunk_index + 1]
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json={
+            "size": 2,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"document_id": document_id}},
+                        {"terms": {"chunk_index": target_indices}},
+                    ]
+                }
+            },
+            "_source": {"excludes": ["embedding"]},
+            "sort": [{"chunk_index": {"order": "asc"}}],
+        },
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
+async def _handle_tool_call(
+    name: str,
+    arguments: str,
+    state: RetrievalState,
+    index: str,
+) -> tuple[str, list[RetrievedContext]]:
+    args = json.loads(arguments) if arguments else {}
+    if name == "search_documents":
+        query = args.get("query", "")
+        results = await retrieve(query, index=index)
+        state.last_query = query
+        state.search_results = {context.lookup_id: context for context in results}
+        return _search_payload(results), results
+    if name == "read_documents":
+        lookup_ids = args.get("lookup_ids", []) or []
+        include_neighbors = bool(args.get("include_neighbors", False))
+        opened: list[RetrievedContext] = []
+        for lookup_id in lookup_ids:
+            context = state.search_results.get(lookup_id)
+            if context is None:
+                continue
+            opened.append(context)
+            if include_neighbors:
+                neighbor_hits = _es_chunk_neighbors(index, context.document_id, context.chunk_index)
+                opened.extend(_hits_to_contexts(neighbor_hits))
+        deduped = _dedupe_contexts(opened, RETRIEVAL_K * 2)
+        state.read_results = deduped
+        return _read_payload(deduped), deduped
     return "[]", []
 
 
@@ -343,25 +396,35 @@ async def _run_agent(
 ) -> tuple[str, list[RetrievedContext], TokenUsage]:
     """Run the agent: retrieve, augment, call LLM with tool loop."""
 
-    # 1. Pre-retrieval (always retrieve before agent runs)
     contexts = await retrieve(user_message)
+    retrieval_state = RetrievalState(
+        last_query=user_message,
+        search_results={context.lookup_id: context for context in contexts},
+        read_results=[],
+    )
 
-    # 2. Augment user message with retrieved context
+    # 1. Start with snippet-level discovery results instead of full chunks.
     augmented = user_message
     if contexts:
         block = "\n\n".join(
-            f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
+            f"[{i+1}] id={c.lookup_id} {(c.title + ': ') if c.title else ''}{_snippet(c.text)}"
             for i, c in enumerate(contexts)
         )
-        augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
+        augmented = (
+            "Search results:\n"
+            f"{block}\n\n"
+            "Use read_documents on promising lookup_ids before relying on a result. "
+            "Set include_neighbors=true when you need adjacent context.\n\n"
+            f"User question: {user_message}"
+        )
 
-    # 3. Build message list
+    # 2. Build message list
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
     messages.append({"role": "user", "content": augmented})
 
-    # 4. Agent loop (tool calling)
+    # 3. Agent loop (tool calling)
     usage = TokenUsage()
     max_iterations = 10
 
@@ -369,7 +432,7 @@ async def _run_agent(
         resp = await _openai.chat.completions.create(
             model=MODEL,
             messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
+            tools=[_SEARCH_TOOL, _READ_TOOL],  # type: ignore[list-item]
         )
         choice = resp.choices[0]
 
@@ -387,9 +450,15 @@ async def _run_agent(
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
             for tc in choice.message.tool_calls:
                 tool_output, tool_contexts = await _handle_tool_call(
-                    tc.function.name, tc.function.arguments
+                    tc.function.name,
+                    tc.function.arguments,
+                    retrieval_state,
+                    ELASTIC_INDEX,
                 )
-                contexts.extend(tool_contexts)
+                if tc.function.name == "read_documents":
+                    contexts = list(retrieval_state.read_results)
+                elif tc.function.name == "search_documents":
+                    contexts = list(retrieval_state.search_results.values())
                 messages.append(
                     {
                         "role": "tool",

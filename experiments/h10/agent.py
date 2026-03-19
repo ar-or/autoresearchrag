@@ -66,6 +66,15 @@ class TokenUsage:
     cached_tokens: int = 0
     output_tokens: int = 0
 
+    def add_openai_usage(self, usage: Any) -> None:
+        if not usage:
+            return
+        self.input_tokens += getattr(usage, "prompt_tokens", 0) or 0
+        self.output_tokens += getattr(usage, "completion_tokens", 0) or 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            self.cached_tokens += getattr(details, "cached_tokens", 0) or 0
+
 
 @dataclass
 class SendMessageResult:
@@ -199,63 +208,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +223,15 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _format_context_block(contexts: list[RetrievedContext]) -> str:
+    if not contexts:
+        return ""
+    return "\n\n".join(
+        f"[{i + 1}] {(c.title + ': ') if c.title else ''}{c.text}"
+        for i, c in enumerate(contexts)
+    )
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -283,8 +244,7 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
@@ -332,6 +292,84 @@ async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[Retrie
     return "[]", []
 
 
+async def _complete_chat(
+    messages: list[dict[str, Any]],
+    usage: TokenUsage,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> Any:
+    resp = await _openai.chat.completions.create(
+        model=MODEL,
+        messages=messages,  # type: ignore[arg-type]
+        tools=tools,  # type: ignore[arg-type]
+    )
+    usage.add_openai_usage(resp.usage)
+    return resp
+
+
+async def _run_asymmetric_generation_debate(
+    user_message: str,
+    history: list[ChatMessage],
+    contexts: list[RetrievedContext],
+    draft_answer: str,
+    usage: TokenUsage,
+) -> str:
+    context_block = _format_context_block(contexts) or "No retrieved evidence."
+    history_lines = "\n".join(f"{m.role}: {m.content}" for m in history[-6:])
+    if not history_lines:
+        history_lines = "(no prior conversation)"
+
+    critic_messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "You are the challenger in an asymmetric answer debate. "
+                "Use only the retrieved evidence to find concrete failure cases in the draft answer. "
+                "List unsupported claims, contradictions, and missing assumptions. "
+                "Be specific and concise."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Conversation history:\n{history_lines}\n\n"
+                f"Retrieved evidence:\n{context_block}\n\n"
+                f"User question:\n{user_message}\n\n"
+                f"Draft answer:\n{draft_answer}\n\n"
+                "Return a short critique with these headings:\n"
+                "supported_claims:\nunsupported_or_risky:\nmissing_assumptions:\nrecommended_revision:"
+            ),
+        },
+    ]
+    critic_resp = await _complete_chat(critic_messages, usage)
+    critique = critic_resp.choices[0].message.content or ""
+
+    synthesis_messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "You are the final synthesizer in an asymmetric debate. "
+                "Produce the best final answer using only the retrieved evidence plus the challenger critique. "
+                "Follow the user's requested output format exactly. "
+                "Revise or simplify claims that are not supported."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Conversation history:\n{history_lines}\n\n"
+                f"Retrieved evidence:\n{context_block}\n\n"
+                f"User question:\n{user_message}\n\n"
+                f"Initial draft:\n{draft_answer}\n\n"
+                f"Challenger critique:\n{critique}\n\n"
+                "Return only the final answer in the exact format requested by the user."
+            ),
+        },
+    ]
+    synthesis_resp = await _complete_chat(synthesis_messages, usage)
+    return synthesis_resp.choices[0].message.content or draft_answer
+
+
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
@@ -349,10 +387,7 @@ async def _run_agent(
     # 2. Augment user message with retrieved context
     augmented = user_message
     if contexts:
-        block = "\n\n".join(
-            f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
-            for i, c in enumerate(contexts)
-        )
+        block = _format_context_block(contexts)
         augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
 
     # 3. Build message list
@@ -366,21 +401,8 @@ async def _run_agent(
     max_iterations = 10
 
     for _ in range(max_iterations):
-        resp = await _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
-        )
+        resp = await _complete_chat(messages, usage, tools=[_SEARCH_TOOL])
         choice = resp.choices[0]
-
-        # Accumulate tokens
-        if resp.usage:
-            usage.input_tokens += resp.usage.prompt_tokens
-            usage.output_tokens += resp.usage.completion_tokens
-            if hasattr(resp.usage, "prompt_tokens_details") and resp.usage.prompt_tokens_details:
-                usage.cached_tokens += getattr(
-                    resp.usage.prompt_tokens_details, "cached_tokens", 0
-                ) or 0
 
         # If the model wants to call tools, execute them and continue
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
@@ -401,6 +423,14 @@ async def _run_agent(
 
         # Done — extract content
         content = choice.message.content or ""
+        if contexts:
+            content = await _run_asymmetric_generation_debate(
+                user_message=user_message,
+                history=history,
+                contexts=contexts,
+                draft_answer=content,
+                usage=usage,
+            )
         return content, contexts, usage
 
     # Fell through max iterations — return last content

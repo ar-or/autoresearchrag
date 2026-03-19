@@ -35,6 +35,9 @@ ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
 ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
+MAX_SCORE_GATE_THRESHOLD: float = float(
+    os.environ.get("MAX_SCORE_GATE_THRESHOLD", "1.35")
+)
 EMBED_MODEL: str = "text-embedding-3-small"
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
@@ -199,63 +202,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +217,19 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+async def _retrieve_hits(
+    query: str,
+    index: str,
+    top_k: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+    candidate_k = max(top_k * 2, top_k)
+    vector_hits = _es_vector_search(index, vector, candidate_k)
+    text_hits = _es_text_search(index, query, candidate_k)
+    fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
+    return vector_hits, text_hits, fused_hits
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -279,18 +238,41 @@ async def retrieve(
     idx = index or ELASTIC_INDEX
     top_k = k or RETRIEVAL_K
     try:
-        vector = (await asyncio.to_thread(embed_batch, [query]))[0]
-        candidate_k = max(top_k * 2, top_k)
-        vector_hits = _es_vector_search(idx, vector, candidate_k)
-        text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        _, _, hits = await _retrieve_hits(query, idx, top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
         except Exception:
             return []
     return _hits_to_contexts(hits)
+
+
+async def _retrieve_generated_query(
+    query: str,
+    index: str | None = None,
+    k: int | None = None,
+) -> tuple[list[RetrievedContext], dict[str, Any]]:
+    idx = index or ELASTIC_INDEX
+    top_k = k or RETRIEVAL_K
+    if not query.strip():
+        return [], {"low_confidence": True, "top_score": 0.0}
+
+    try:
+        vector_hits, text_hits, fused_hits = await _retrieve_hits(query, idx, top_k)
+        top_score = float(vector_hits[0].get("_score", 0.0) or 0.0) if vector_hits else 0.0
+        if top_score < MAX_SCORE_GATE_THRESHOLD:
+            return [], {"low_confidence": True, "top_score": round(top_score, 4)}
+        return _hits_to_contexts(fused_hits), {
+            "low_confidence": False,
+            "top_score": round(top_score, 4),
+        }
+    except Exception:
+        fallback_hits = await retrieve(query, index=idx, k=top_k)
+        fallback_top_score = fallback_hits[0].score if fallback_hits else 0.0
+        return fallback_hits, {
+            "low_confidence": False,
+            "top_score": round(float(fallback_top_score), 4),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -317,17 +299,33 @@ async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[Retrie
     if name == "search_documents":
         args = json.loads(arguments)
         query = args.get("query", "")
-        results = await retrieve(query)
-        payload = [
-            {
-                "rank": i + 1,
-                "document_id": r.document_id,
-                "title": r.title,
-                "text": r.text,
-                "score": r.score,
+        results, meta = await _retrieve_generated_query(query)
+        if meta["low_confidence"]:
+            payload = {
+                "low_confidence": True,
+                "query": query,
+                "top_score": meta["top_score"],
+                "message": (
+                    "The top neural retrieval hit is weak for this query. "
+                    "Retry with a more specific search focused on the key entity, metric, or time period."
+                ),
             }
-            for i, r in enumerate(results)
-        ]
+        else:
+            payload = {
+                "low_confidence": False,
+                "query": query,
+                "top_score": meta["top_score"],
+                "results": [
+                    {
+                        "rank": i + 1,
+                        "document_id": r.document_id,
+                        "title": r.title,
+                        "text": r.text,
+                        "score": r.score,
+                    }
+                    for i, r in enumerate(results)
+                ],
+            }
         return json.dumps(payload), results
     return "[]", []
 

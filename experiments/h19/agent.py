@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -29,7 +31,7 @@ MODEL: str = os.environ.get("ORAGENT_MODEL", "gpt-5-mini")
 SYSTEM_PROMPT: str = os.environ.get(
     "ORAGENT_SYSTEM_PROMPT", "You are a helpful AI assistant."
 )
-ELASTIC_URL: str = os.environ.get("ELASTIC_URL", "http://localhost:9200")
+ELASTIC_URL: str = os.environ.get("ES_HOST", "http://localhost:9200")
 ELASTIC_API_KEY: str = os.environ.get("ELASTIC_API_KEY", "")
 ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
@@ -82,6 +84,14 @@ class Session:
     messages: list[ChatMessage]
     created_at: str
     updated_at: str
+
+
+@dataclass
+class RetrievalTraceStep:
+    coverage: float
+    supportive_contexts: int
+    novelty_ratio: float
+    gain: float
 
 
 # ---------------------------------------------------------------------------
@@ -199,63 +209,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +224,294 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _merge_usage(total: TokenUsage, prompt_tokens: int, cached_tokens: int, output_tokens: int) -> None:
+    total.input_tokens += prompt_tokens
+    total.cached_tokens += cached_tokens
+    total.output_tokens += output_tokens
+
+
+def _format_context_block(contexts: list[RetrievedContext]) -> str:
+    return "\n\n".join(
+        f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
+        for i, c in enumerate(contexts)
+    )
+
+
+def _dedupe_contexts(contexts: list[RetrievedContext], limit: int) -> list[RetrievedContext]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[RetrievedContext] = []
+    for context in contexts:
+        key = (context.document_id, context.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+async def _generate_next_reasoning_sentence(
+    question: str,
+    contexts: list[RetrievedContext],
+) -> tuple[str, TokenUsage]:
+    prompt = (
+        "You are helping a retrieval system answer a multi-hop question.\n"
+        "Given the current evidence, write exactly one factual next reasoning sentence that "
+        "captures the unresolved hop to retrieve next.\n"
+        "Rules:\n"
+        "- Return exactly one sentence.\n"
+        "- Keep named entities, dates, and key relations.\n"
+        "- Do not answer the question.\n"
+        "- If no better follow-up hop is needed, return NONE.\n\n"
+        f"Question: {question}\n\n"
+        f"Retrieved documents:\n{_format_context_block(contexts)}"
+    )
+    try:
+        resp = await _openai.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write one grounded retrieval-focused reasoning sentence.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except Exception:
+        return "", TokenUsage()
+
+    usage = TokenUsage()
+    if resp.usage:
+        _merge_usage(
+            usage,
+            resp.usage.prompt_tokens,
+            getattr(getattr(resp.usage, "prompt_tokens_details", None), "cached_tokens", 0)
+            or 0,
+            resp.usage.completion_tokens,
+        )
+
+    sentence = (resp.choices[0].message.content or "").strip()
+    if not sentence or sentence.upper() == "NONE":
+        return "", usage
+    return sentence, usage
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "what",
+    "when",
+    "which",
+    "who",
+    "with",
+}
+
+
+def _query_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) >= 3 and token not in _STOPWORDS
+    }
+
+
+def _context_signature(context: RetrievedContext) -> tuple[str, str, str]:
+    return (context.document_id, context.title, context.text[:160])
+
+
+def _context_overlap(query_terms: set[str], context: RetrievedContext) -> int:
+    haystack = f"{context.title} {context.text}".lower()
+    return sum(1 for term in query_terms if term in haystack)
+
+
+def _query_complexity_bonus(query: str) -> float:
+    lowered = query.lower()
+    cues = (
+        "both",
+        "before",
+        "after",
+        "which other",
+        "same",
+        "different",
+        "compare",
+    )
+    return 0.15 if any(cue in lowered for cue in cues) else 0.0
+
+
+def _trace_step(
+    query: str,
+    contexts: list[RetrievedContext],
+    latest_batch: list[RetrievedContext],
+    previous_coverage: float,
+) -> RetrievalTraceStep:
+    query_terms = _query_terms(query)
+    if not query_terms or not contexts:
+        return RetrievalTraceStep(
+            coverage=0.0,
+            supportive_contexts=0,
+            novelty_ratio=0.0,
+            gain=0.0,
+        )
+
+    matched_terms: set[str] = set()
+    supportive_contexts = 0
+    for context in contexts:
+        overlap = _context_overlap(query_terms, context)
+        if overlap >= 2:
+            supportive_contexts += 1
+        haystack = f"{context.title} {context.text}".lower()
+        matched_terms.update(term for term in query_terms if term in haystack)
+
+    coverage = len(matched_terms) / max(len(query_terms), 1)
+    previous_signatures = {
+        _context_signature(context)
+        for context in contexts[:-len(latest_batch)]
+    } if latest_batch else set()
+    novel = sum(
+        1 for context in latest_batch if _context_signature(context) not in previous_signatures
+    )
+    novelty_ratio = novel / len(latest_batch) if latest_batch else 0.0
+    return RetrievalTraceStep(
+        coverage=coverage,
+        supportive_contexts=supportive_contexts,
+        novelty_ratio=novelty_ratio,
+        gain=max(coverage - previous_coverage, 0.0),
+    )
+
+
+def _should_continue_with_q_lambda_proxy(
+    query: str,
+    trace: list[RetrievalTraceStep],
+) -> bool:
+    if not trace:
+        return True
+    search_round = len(trace) - 1
+    if search_round >= 2:
+        return False
+
+    current = trace[-1]
+    complexity_bonus = _query_complexity_bonus(query)
+
+    continue_value = (
+        0.55 * (1.0 - current.coverage)
+        + 0.25 * current.gain
+        + 0.20 * current.novelty_ratio
+        + complexity_bonus
+        - 0.15 * search_round
+    )
+    stop_value = (
+        0.60 * current.coverage
+        + 0.20 * min(current.supportive_contexts / 2.0, 1.0)
+        + 0.20 * (1.0 - current.novelty_ratio if search_round > 0 else 0.0)
+    )
+    return continue_value > stop_value
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    a_norm = math.sqrt(sum(x * x for x in a))
+    b_norm = math.sqrt(sum(y * y for y in b))
+    if not a_norm or not b_norm:
+        return 0.0
+    return dot / (a_norm * b_norm)
+
+
+async def _sentence_rerank_contexts(
+    query: str,
+    contexts: list[RetrievedContext],
+    top_k: int,
+) -> list[RetrievedContext]:
+    if not contexts:
+        return contexts
+
+    query_vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+    sentence_texts: list[str] = []
+    sentence_to_context: list[int] = []
+    for index, context in enumerate(contexts):
+        for sentence in _split_sentences(context.text)[:6]:
+            sentence_texts.append(sentence)
+            sentence_to_context.append(index)
+    if not sentence_texts:
+        return contexts[:top_k]
+
+    sentence_vectors = await asyncio.to_thread(embed_batch, sentence_texts)
+    best_scores = [-1.0] * len(contexts)
+    for idx, vector in enumerate(sentence_vectors):
+        context_index = sentence_to_context[idx]
+        best_scores[context_index] = max(
+            best_scores[context_index],
+            _cosine_similarity(query_vector, vector),
+        )
+
+    ranked = sorted(
+        enumerate(contexts),
+        key=lambda item: (best_scores[item[0]], item[1].score),
+        reverse=True,
+    )
+    return [context for _, context in ranked[:top_k]]
+
+
+def _use_rich_retrieval(query: str) -> bool:
+    lowered = query.lower()
+    cues = (
+        "both",
+        "compare",
+        "which other",
+        "same",
+        "different",
+        "before",
+        "after",
+        "ratio",
+    )
+    return len(query.split()) >= 12 or any(cue in lowered for cue in cues)
+
+
+async def _rewrite_retrieval_query(query: str) -> str:
+    prompt = (
+        "Rewrite the question into a short retrieval query that preserves the original meaning, "
+        "keeps key entities, dates, and numbers, and removes filler words. "
+        "Return only the rewritten query.\n\n"
+        f"Question: {query}"
+    )
+    try:
+        resp = await _openai.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": "You rewrite questions for document retrieval."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        rewritten = (resp.choices[0].message.content or "").strip()
+        return rewritten or query
+    except Exception:
+        return query
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -278,19 +519,26 @@ async def retrieve(
 ) -> list[RetrievedContext]:
     idx = index or ELASTIC_INDEX
     top_k = k or RETRIEVAL_K
+    retrieval_query = query
+    candidate_k = max(top_k * 2, top_k)
+    if _use_rich_retrieval(query):
+        retrieval_query = await _rewrite_retrieval_query(query)
+        candidate_k = max(top_k * 3, top_k)
     try:
-        vector = (await asyncio.to_thread(embed_batch, [query]))[0]
-        candidate_k = max(top_k * 2, top_k)
+        vector = (await asyncio.to_thread(embed_batch, [retrieval_query]))[0]
         vector_hits = _es_vector_search(idx, vector, candidate_k)
-        text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        text_hits = _es_text_search(idx, retrieval_query, candidate_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
-            hits = _es_text_search(idx, query, top_k)
+            hits = _es_text_search(idx, retrieval_query, top_k)
         except Exception:
             return []
-    return _hits_to_contexts(hits)
+    contexts = _hits_to_contexts(hits)
+    try:
+        return await _sentence_rerank_contexts(retrieval_query, contexts, top_k)
+    except Exception:
+        return contexts[:top_k]
 
 
 # ---------------------------------------------------------------------------
@@ -344,15 +592,35 @@ async def _run_agent(
     """Run the agent: retrieve, augment, call LLM with tool loop."""
 
     # 1. Pre-retrieval (always retrieve before agent runs)
+    print(f"    [search] {user_message[:200]}")
     contexts = await retrieve(user_message)
+    print(f"    [results] {len(contexts)} hits: {[c.title for c in contexts]}")
+    usage = TokenUsage()
+
+    if contexts:
+        reasoning_sentence, reasoning_usage = await _generate_next_reasoning_sentence(
+            user_message,
+            contexts,
+        )
+        _merge_usage(
+            usage,
+            reasoning_usage.input_tokens,
+            reasoning_usage.cached_tokens,
+            reasoning_usage.output_tokens,
+        )
+        if reasoning_sentence:
+            print(f"    [cot_query] {reasoning_sentence[:200]}")
+            follow_up_contexts = await retrieve(reasoning_sentence)
+            print(
+                f"    [cot_results] {len(follow_up_contexts)} hits: "
+                f"{[c.title for c in follow_up_contexts]}"
+            )
+            contexts = _dedupe_contexts(contexts + follow_up_contexts, RETRIEVAL_K)
 
     # 2. Augment user message with retrieved context
     augmented = user_message
     if contexts:
-        block = "\n\n".join(
-            f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
-            for i, c in enumerate(contexts)
-        )
+        block = _format_context_block(contexts)
         augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
 
     # 3. Build message list
@@ -362,14 +630,19 @@ async def _run_agent(
     messages.append({"role": "user", "content": augmented})
 
     # 4. Agent loop (tool calling)
-    usage = TokenUsage()
     max_iterations = 10
+    trace = [_trace_step(user_message, contexts, contexts, 0.0)]
+    allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
 
     for _ in range(max_iterations):
+        request_kwargs: dict[str, Any] = {
+            "model": MODEL,
+            "messages": messages,
+        }
+        if allow_search:
+            request_kwargs["tools"] = [_SEARCH_TOOL]
         resp = await _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
+            **request_kwargs,  # type: ignore[arg-type]
         )
         choice = resp.choices[0]
 
@@ -385,11 +658,16 @@ async def _run_agent(
         # If the model wants to call tools, execute them and continue
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
+            latest_batch: list[RetrievedContext] = []
             for tc in choice.message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                print(f"    [tool_call] {tc.function.name}({tc.function.arguments})")
                 tool_output, tool_contexts = await _handle_tool_call(
                     tc.function.name, tc.function.arguments
                 )
+                print(f"    [results] {len(tool_contexts)} hits: {[c.title for c in tool_contexts]}")
                 contexts.extend(tool_contexts)
+                latest_batch.extend(tool_contexts)
                 messages.append(
                     {
                         "role": "tool",
@@ -397,10 +675,20 @@ async def _run_agent(
                         "content": tool_output,
                     }
                 )
+            trace.append(
+                _trace_step(
+                    user_message,
+                    contexts,
+                    latest_batch,
+                    trace[-1].coverage,
+                )
+            )
+            allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
             continue
 
         # Done — extract content
         content = choice.message.content or ""
+        print(f"    [answer] {content[:200]}")
         return content, contexts, usage
 
     # Fell through max iterations — return last content

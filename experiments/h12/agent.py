@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -35,6 +36,8 @@ ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
 ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
+NQC_TOP_DOCS: int = int(os.environ.get("NQC_TOP_DOCS", "100"))
+NQC_TOOL_THRESHOLD: float = float(os.environ.get("NQC_TOOL_THRESHOLD", "0.10"))
 EMBED_MODEL: str = "text-embedding-3-small"
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
@@ -199,63 +202,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +217,39 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _nqc_score(hits: list[dict[str, Any]], max_items: int | None = None) -> float:
+    limit = max_items or NQC_TOP_DOCS
+    scores = [
+        float(hit.get("_score", 0.0) or 0.0)
+        for hit in hits[:limit]
+        if float(hit.get("_score", 0.0) or 0.0) > 0.0
+    ]
+    if len(scores) < 2:
+        return 0.0
+    mean_score = statistics.fmean(scores)
+    if abs(mean_score) < 1e-9:
+        return 0.0
+    return statistics.pstdev(scores) / abs(mean_score)
+
+
+def _tool_retrieval_plan(
+    vector_hits: list[dict[str, Any]],
+    text_hits: list[dict[str, Any]],
+) -> tuple[str, float, float]:
+    vector_nqc = _nqc_score(vector_hits)
+    text_nqc = _nqc_score(text_hits)
+    vector_ok = vector_nqc >= NQC_TOOL_THRESHOLD
+    text_ok = text_nqc >= NQC_TOOL_THRESHOLD
+
+    if vector_ok and text_ok:
+        return "fuse", vector_nqc, text_nqc
+    if vector_ok:
+        return "vector", vector_nqc, text_nqc
+    if text_ok:
+        return "text", vector_nqc, text_nqc
+    return "retry", vector_nqc, text_nqc
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -283,14 +262,56 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
         except Exception:
             return []
     return _hits_to_contexts(hits)
+
+
+async def retrieve_tool_query(
+    query: str,
+    index: str | None = None,
+    k: int | None = None,
+) -> tuple[list[RetrievedContext], dict[str, Any]]:
+    idx = index or ELASTIC_INDEX
+    top_k = k or RETRIEVAL_K
+    if not query.strip():
+        return [], {"plan": "retry", "vector_nqc": 0.0, "text_nqc": 0.0}
+
+    try:
+        vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+        candidate_k = max(top_k * 4, NQC_TOP_DOCS, top_k)
+        vector_hits = _es_vector_search(idx, vector, candidate_k)
+        text_hits = _es_text_search(idx, query, candidate_k)
+        plan, vector_nqc, text_nqc = _tool_retrieval_plan(vector_hits, text_hits)
+
+        if plan == "vector":
+            hits = vector_hits[:top_k]
+        elif plan == "text":
+            hits = text_hits[:top_k]
+        elif plan == "fuse":
+            hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
+        else:
+            hits = []
+
+        return _hits_to_contexts(hits), {
+            "plan": plan,
+            "vector_nqc": round(vector_nqc, 4),
+            "text_nqc": round(text_nqc, 4),
+        }
+    except Exception:
+        try:
+            hits = _es_text_search(idx, query, top_k)
+        except Exception:
+            return [], {"plan": "retry", "vector_nqc": 0.0, "text_nqc": 0.0}
+        return _hits_to_contexts(hits), {
+            "plan": "text",
+            "vector_nqc": 0.0,
+            "text_nqc": round(_nqc_score(hits), 4),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -317,17 +338,36 @@ async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[Retrie
     if name == "search_documents":
         args = json.loads(arguments)
         query = args.get("query", "")
-        results = await retrieve(query)
-        payload = [
-            {
-                "rank": i + 1,
-                "document_id": r.document_id,
-                "title": r.title,
-                "text": r.text,
-                "score": r.score,
+        results, retrieval_meta = await retrieve_tool_query(query)
+        if retrieval_meta["plan"] == "retry":
+            payload = {
+                "low_confidence": True,
+                "query": query,
+                "vector_nqc": retrieval_meta["vector_nqc"],
+                "text_nqc": retrieval_meta["text_nqc"],
+                "message": (
+                    "Retrieval confidence is low for this query. "
+                    "Retry with a more specific search focused on the key entity, metric, or time period."
+                ),
             }
-            for i, r in enumerate(results)
-        ]
+        else:
+            payload = {
+                "low_confidence": False,
+                "query": query,
+                "retrieval_plan": retrieval_meta["plan"],
+                "vector_nqc": retrieval_meta["vector_nqc"],
+                "text_nqc": retrieval_meta["text_nqc"],
+                "results": [
+                    {
+                        "rank": i + 1,
+                        "document_id": r.document_id,
+                        "title": r.title,
+                        "text": r.text,
+                        "score": r.score,
+                    }
+                    for i, r in enumerate(results)
+                ],
+            }
         return json.dumps(payload), results
     return "[]", []
 

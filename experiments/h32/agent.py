@@ -36,6 +36,27 @@ RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
 ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
 EMBED_MODEL: str = "text-embedding-3-small"
+TRAJECTORY_DISTILLATION_PROMPT = """Imitate the following successful retrieval trajectories.
+
+Trajectory A:
+Question type: numeric table lookup
+1. Search once with the metric name, comparison year, and business entity.
+2. Use the top evidence chunk to compute the requested ratio or delta.
+3. Stop searching unless the evidence is missing one required operand.
+4. Return only the requested numeric form.
+
+Trajectory B:
+Question type: entity comparison or bridge question
+1. Search once with the main entities or titles from the question.
+2. Extract the decisive attribute from retrieved evidence.
+3. If one entity remains unresolved, run one focused follow-up search for that missing entity only.
+4. Return the shortest grounded answer that matches the requested format.
+
+Policy:
+- Prefer one high-precision retrieval over multiple broad searches.
+- Do not repeat near-identical searches.
+- Use retrieved evidence before answering.
+- Keep the final answer in the exact format requested by the user."""
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
 
@@ -199,63 +220,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -283,8 +247,7 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
@@ -356,7 +319,12 @@ async def _run_agent(
         augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
 
     # 3. Build message list
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": f"{SYSTEM_PROMPT}\n\n{TRAJECTORY_DISTILLATION_PROMPT}",
+        }
+    ]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
     messages.append({"role": "user", "content": augmented})

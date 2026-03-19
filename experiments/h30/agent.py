@@ -84,6 +84,12 @@ class Session:
     updated_at: str
 
 
+@dataclass
+class RetrievalState:
+    last_query: str = ""
+    contexts: list[RetrievedContext] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # In-memory session store
 # ---------------------------------------------------------------------------
@@ -199,63 +205,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +220,20 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _dedupe_contexts(contexts: list[RetrievedContext], limit: int | None = None) -> list[RetrievedContext]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[RetrievedContext] = []
+    for context in contexts:
+        key = (context.document_id, context.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+        if limit is not None and len(deduped) >= limit:
+            break
+    return deduped
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -283,8 +246,7 @@ async def retrieve(
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
@@ -306,29 +268,106 @@ _SEARCH_TOOL = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
+                "retrieval_scale": {
+                    "type": "integer",
+                    "description": "Optional multiplier for how many candidates to fetch before taking the top results.",
+                    "minimum": 1,
+                    "maximum": 4,
+                },
             },
             "required": ["query"],
         },
     },
 }
 
+_SHAPE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shape_context",
+        "description": (
+            "Refine the current working set of retrieved documents by including specific document IDs, "
+            "excluding distracting document IDs, or widening retrieval with a larger candidate pool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional refreshed query. If omitted, reuse the last retrieval query.",
+                },
+                "include_docs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Document IDs that must be preserved in the working set if available.",
+                },
+                "exclude_docs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Document IDs to remove from the working set.",
+                },
+                "retrieval_scale": {
+                    "type": "integer",
+                    "description": "Multiplier for widening retrieval before the final top-k cut.",
+                    "minimum": 1,
+                    "maximum": 4,
+                },
+            },
+        },
+    },
+}
 
-async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[RetrievedContext]]:
-    if name == "search_documents":
-        args = json.loads(arguments)
-        query = args.get("query", "")
-        results = await retrieve(query)
-        payload = [
+
+def _contexts_to_payload(contexts: list[RetrievedContext]) -> str:
+    return json.dumps(
+        [
             {
                 "rank": i + 1,
-                "document_id": r.document_id,
-                "title": r.title,
-                "text": r.text,
-                "score": r.score,
+                "document_id": context.document_id,
+                "title": context.title,
+                "text": context.text,
+                "score": context.score,
             }
-            for i, r in enumerate(results)
+            for i, context in enumerate(contexts)
         ]
-        return json.dumps(payload), results
+    )
+
+
+def _shape_contexts(
+    current: list[RetrievedContext],
+    fresh: list[RetrievedContext],
+    include_docs: list[str],
+    exclude_docs: list[str],
+) -> list[RetrievedContext]:
+    include_set = {doc_id for doc_id in include_docs if doc_id}
+    exclude_set = {doc_id for doc_id in exclude_docs if doc_id}
+    prioritized = [ctx for ctx in current + fresh if ctx.document_id in include_set]
+    pool = prioritized + fresh + current
+    filtered = [ctx for ctx in pool if ctx.document_id not in exclude_set]
+    return _dedupe_contexts(filtered, RETRIEVAL_K)
+
+
+async def _handle_tool_call(
+    name: str,
+    arguments: str,
+    state: RetrievalState,
+) -> tuple[str, list[RetrievedContext]]:
+    args = json.loads(arguments) if arguments else {}
+    if name == "search_documents":
+        query = args.get("query", "")
+        scale = max(1, min(int(args.get("retrieval_scale", 1) or 1), 4))
+        results = await retrieve(query, k=RETRIEVAL_K * scale)
+        state.last_query = query
+        state.contexts = _dedupe_contexts(results, RETRIEVAL_K)
+        return _contexts_to_payload(state.contexts), state.contexts
+    if name == "shape_context":
+        query = args.get("query") or state.last_query
+        scale = max(1, min(int(args.get("retrieval_scale", 1) or 1), 4))
+        include_docs = args.get("include_docs", []) or []
+        exclude_docs = args.get("exclude_docs", []) or []
+        fresh = await retrieve(query, k=RETRIEVAL_K * scale) if query else state.contexts
+        state.last_query = query
+        state.contexts = _shape_contexts(state.contexts, fresh, include_docs, exclude_docs)
+        return _contexts_to_payload(state.contexts), state.contexts
     return "[]", []
 
 
@@ -345,6 +384,7 @@ async def _run_agent(
 
     # 1. Pre-retrieval (always retrieve before agent runs)
     contexts = await retrieve(user_message)
+    retrieval_state = RetrievalState(last_query=user_message, contexts=list(contexts))
 
     # 2. Augment user message with retrieved context
     augmented = user_message
@@ -353,7 +393,13 @@ async def _run_agent(
             f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
             for i, c in enumerate(contexts)
         )
-        augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
+        augmented = (
+            "Retrieved documents:\n"
+            f"{block}\n\n"
+            "If results look noisy or redundant, use `shape_context` to include or exclude specific document IDs "
+            "or widen retrieval before answering.\n\n"
+            f"User question: {user_message}"
+        )
 
     # 3. Build message list
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -369,7 +415,7 @@ async def _run_agent(
         resp = await _openai.chat.completions.create(
             model=MODEL,
             messages=messages,  # type: ignore[arg-type]
-            tools=[_SEARCH_TOOL],  # type: ignore[list-item]
+            tools=[_SEARCH_TOOL, _SHAPE_TOOL],  # type: ignore[list-item]
         )
         choice = resp.choices[0]
 
@@ -387,9 +433,11 @@ async def _run_agent(
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
             for tc in choice.message.tool_calls:
                 tool_output, tool_contexts = await _handle_tool_call(
-                    tc.function.name, tc.function.arguments
+                    tc.function.name,
+                    tc.function.arguments,
+                    retrieval_state,
                 )
-                contexts.extend(tool_contexts)
+                contexts = list(retrieval_state.contexts)
                 messages.append(
                     {
                         "role": "tool",

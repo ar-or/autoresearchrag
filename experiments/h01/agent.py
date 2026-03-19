@@ -6,7 +6,6 @@ Public API:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -19,7 +18,6 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import requests as _requests
 from openai import AsyncOpenAI
-from scripts.embedder import embed_batch
 
 # ---------------------------------------------------------------------------
 # Settings (mirrors oragent/src/settings.ts)
@@ -33,11 +31,9 @@ ELASTIC_URL: str = os.environ.get("ELASTIC_URL", "http://localhost:9200")
 ELASTIC_API_KEY: str = os.environ.get("ELASTIC_API_KEY", "")
 ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
-ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
-OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
 EMBED_MODEL: str = "text-embedding-3-small"
 
-_openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
+_openai = AsyncOpenAI()
 
 # ---------------------------------------------------------------------------
 # Types
@@ -141,10 +137,7 @@ def _es_vector_search(
         "_source": {"excludes": ["embedding"]},
     }
     r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json=body,
-        timeout=ELASTIC_TIMEOUT_S,
+        f"{ELASTIC_URL}/{index}/_search", headers=_es_headers(), json=body
     )
     if not r.ok:
         return _es_text_search(index, "", k)
@@ -163,7 +156,6 @@ def _es_text_search(
         f"{ELASTIC_URL}/{index}/_search",
         headers=_es_headers(),
         json={"size": k, "query": q},
-        timeout=ELASTIC_TIMEOUT_S,
     )
     if not r.ok:
         return []
@@ -199,63 +191,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -279,12 +214,12 @@ async def retrieve(
     idx = index or ELASTIC_INDEX
     top_k = k or RETRIEVAL_K
     try:
-        vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+        resp = await _openai.embeddings.create(input=query, model=EMBED_MODEL)
+        vector = resp.data[0].embedding
         candidate_k = max(top_k * 2, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)

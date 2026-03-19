@@ -26,6 +26,7 @@ from scripts.embedder import embed_batch
 # ---------------------------------------------------------------------------
 
 MODEL: str = os.environ.get("ORAGENT_MODEL", "gpt-5-mini")
+RETRIEVAL_DEBATE_MODEL: str = os.environ.get("RETRIEVAL_DEBATE_MODEL", MODEL)
 SYSTEM_PROMPT: str = os.environ.get(
     "ORAGENT_SYSTEM_PROMPT", "You are a helpful AI assistant."
 )
@@ -33,6 +34,9 @@ ELASTIC_URL: str = os.environ.get("ELASTIC_URL", "http://localhost:9200")
 ELASTIC_API_KEY: str = os.environ.get("ELASTIC_API_KEY", "")
 ELASTIC_INDEX: str = os.environ.get("ES_INDEX", "mtrag")
 RETRIEVAL_K: int = int(os.environ.get("RETRIEVAL_K", "5"))
+RETRIEVAL_DEBATE_POOL_MULTIPLIER: int = int(
+    os.environ.get("RETRIEVAL_DEBATE_POOL_MULTIPLIER", "3")
+)
 ELASTIC_TIMEOUT_S: float = float(os.environ.get("ELASTIC_TIMEOUT_S", "30"))
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
 EMBED_MODEL: str = "text-embedding-3-small"
@@ -199,63 +203,6 @@ def _fuse_hits_rrf(*ranked_lists: list[dict[str, Any]], k: int) -> list[dict[str
     return [item["hit"] for item in ranked[:k]]
 
 
-def _dedupe_hits(hits: list[dict[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        identity = _hit_identity(hit)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(hit)
-        if k is not None and len(deduped) >= k:
-            break
-    return deduped
-
-
-def _es_neighbor_hits(index: str, document_id: str, chunk_indices: list[int]) -> list[dict[str, Any]]:
-    if not document_id or not chunk_indices:
-        return []
-    r = _requests.post(
-        f"{ELASTIC_URL}/{index}/_search",
-        headers=_es_headers(),
-        json={
-            "size": len(chunk_indices),
-            "sort": [{"chunk_index": {"order": "asc"}}],
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"document_id": document_id}},
-                        {"terms": {"chunk_index": chunk_indices}},
-                    ]
-                }
-            },
-            "_source": {"excludes": ["embedding"]},
-        },
-        timeout=ELASTIC_TIMEOUT_S,
-    )
-    if not r.ok:
-        return []
-    return r.json().get("hits", {}).get("hits", [])
-
-
-def _expand_with_neighbors(index: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    expanded = list(hits)
-    for hit in hits[:2]:
-        src = hit.get("_source", {})
-        document_id = src.get("document_id", "")
-        chunk_index = src.get("chunk_index")
-        if document_id == "" or not isinstance(chunk_index, int):
-            continue
-        neighbors = [
-            neighbor
-            for neighbor in (chunk_index - 1, chunk_index + 1)
-            if neighbor >= 0
-        ]
-        expanded.extend(_es_neighbor_hits(index, document_id, neighbors))
-    return _dedupe_hits(expanded, k=k)
-
-
 def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
@@ -271,6 +218,94 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     return out
 
 
+def _context_key(context: RetrievedContext) -> str:
+    return f"{context.document_id}\n{context.title}\n{context.text[:160]}"
+
+
+async def _debate_rerank_contexts(
+    query: str,
+    contexts: list[RetrievedContext],
+    top_k: int,
+) -> list[RetrievedContext]:
+    if len(contexts) <= top_k:
+        return contexts
+
+    candidate_lines = []
+    for idx, context in enumerate(contexts, start=1):
+        title = context.title or "(untitled)"
+        candidate_lines.append(
+            f"[{idx}] title={title}\nscore={context.score:.4f}\ntext={context.text}"
+        )
+
+    prompt = "\n\n".join(
+        [
+            "You are reranking retrieval candidates for a RAG system.",
+            f"Question: {query}",
+            "For each candidate, first act as a proponent and identify direct support.",
+            "Then act as an opponent and identify weaknesses, ambiguity, or misleading details.",
+            "Return strict JSON with an item for every candidate:",
+            '{"candidates":[{"rank":1,"support_score":0,"challenge_score":0,"decision":"keep","note":"..."}]}',
+            "Rules:",
+            "- support_score and challenge_score are integers from 0 to 3.",
+            "- decision must be one of keep, borderline, drop.",
+            "- Prefer candidates with direct evidence needed to answer the question.",
+            "- Penalize candidates that are off-topic, duplicate, or likely to mislead.",
+            "Candidates:",
+            "\n\n".join(candidate_lines),
+        ]
+    )
+
+    try:
+        resp = await _openai.chat.completions.create(
+            model=RETRIEVAL_DEBATE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content or "{}"
+        payload = json.loads(content)
+    except Exception:
+        return contexts[:top_k]
+
+    candidates = payload.get("candidates", [])
+    reranked: list[tuple[float, RetrievedContext]] = []
+    seen: set[int] = set()
+    for item in candidates:
+        try:
+            rank = int(item.get("rank"))
+        except (TypeError, ValueError):
+            continue
+        if rank < 1 or rank > len(contexts) or rank in seen:
+            continue
+        seen.add(rank)
+        context = contexts[rank - 1]
+        try:
+            support_score = int(item.get("support_score", 0))
+        except (TypeError, ValueError):
+            support_score = 0
+        try:
+            challenge_score = int(item.get("challenge_score", 0))
+        except (TypeError, ValueError):
+            challenge_score = 0
+        decision = str(item.get("decision", "borderline")).lower()
+        decision_bonus = {"keep": 1.5, "borderline": 0.5, "drop": -1.0}.get(decision, 0.0)
+        rerank_score = (support_score * 2.0) - challenge_score + decision_bonus
+        reranked.append((rerank_score, context))
+
+    if not reranked:
+        return contexts[:top_k]
+
+    scored = { _context_key(context): score for score, context in reranked }
+    ranked_contexts = sorted(
+        contexts,
+        key=lambda context: (
+            scored.get(_context_key(context), float("-inf")),
+            context.score,
+        ),
+        reverse=True,
+    )
+    return ranked_contexts[:top_k]
+
+
 async def retrieve(
     query: str,
     index: str | None = None,
@@ -280,17 +315,17 @@ async def retrieve(
     top_k = k or RETRIEVAL_K
     try:
         vector = (await asyncio.to_thread(embed_batch, [query]))[0]
-        candidate_k = max(top_k * 2, top_k)
+        candidate_k = max(top_k * RETRIEVAL_DEBATE_POOL_MULTIPLIER, top_k)
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, query, candidate_k)
-        fused_hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
-        hits = _expand_with_neighbors(idx, fused_hits, k=top_k)
+        hits = _fuse_hits_rrf(vector_hits, text_hits, k=candidate_k)
     except Exception:
         try:
             hits = _es_text_search(idx, query, top_k)
         except Exception:
             return []
-    return _hits_to_contexts(hits)
+    contexts = _hits_to_contexts(hits)
+    return await _debate_rerank_contexts(query, contexts, top_k)
 
 
 # ---------------------------------------------------------------------------
