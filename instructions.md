@@ -63,7 +63,7 @@ Experiment Setup
    touch experiments/h<id>/__init__.py
    cp agent.py experiments/h<id>/agent.py
    ```
-   Reference `experiments/TEMPLATE/` for a minimal starting point.
+   Always copy the full champion `agent.py` — do not import or delegate to the root agent. Each experiment must be fully self-contained so it remains reproducible even if the root champion changes later. `experiments/TEMPLATE/` exists only to document the file structure, not as a base to patch.
 3. Read the current champion from `best_result.txt` and treat its `elastic_index` value as the baseline Elasticsearch index for this experiment. If `best_result.txt` is uninitialized or lacks `elastic_index`, fall back to `mtrag`.
 4. Set environment variables:
    - `N=30`
