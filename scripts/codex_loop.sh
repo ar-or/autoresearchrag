@@ -9,7 +9,7 @@
 #   ./scripts/codex_loop.sh  # uses default prompt
 #   MAX_ITERATIONS=100 ./scripts/codex_loop.sh "Start evaluating"
 
-set -euo pipefail
+set -uo pipefail
 
 CONTINUE_MSG="Proceed in evaluating all hypotheses until the last one is done. When all done, respond with 'all done'"
 DONE_MARKER="all done"
@@ -45,7 +45,14 @@ stream_and_capture() {
 }
 
 run_codex() {
-    "$@" 2>>"$ERRLOG" | stream_and_capture
+    local rc=0
+    "$@" 2> >(tee -a "$ERRLOG" >&2) | stream_and_capture || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        err "codex exited with code $rc"
+        err "stderr tail:"
+        tail -20 "$ERRLOG" >&2
+    fi
+    return "$rc"
 }
 
 info "stderr → $ERRLOG"
