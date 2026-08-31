@@ -11,7 +11,7 @@ build/
 # Virtual environment
 .venv/
 .venv2/
-.wslenv/
+.wslvenv/
 
 # Environment variables
 .env
@@ -25,13 +25,14 @@ github_deploy_key.pub
 .vscode/
 *.swp
 *.swo
+*~local
+
+# Claude Code local settings
+.claude/settings.local.json
 
 # OS
 .DS_Store
 Thumbs.db
-
-# uv
-uv.lock
 
 # Node.js
 node_modules/
