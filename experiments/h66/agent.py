@@ -127,6 +127,65 @@ def _es_title_search(index: str, query: str, k: int) -> list[dict[str, Any]]:
     return r.json().get("hits", {}).get("hits", [])
 
 
+def _es_table_search(index: str, query: str, k: int) -> list[dict[str, Any]]:
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json={
+            "size": k,
+            "query": {
+                "bool": {
+                    "filter": [{"term": {"view_type": "table_summary"}}],
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["title^4", "text^3", "table_title^3", "table_schema^2"],
+                            }
+                        }
+                    ],
+                }
+            },
+        },
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
+def _es_row_lookup(index: str, parent_ids: list[str], query: str, k: int) -> list[dict[str, Any]]:
+    if not parent_ids:
+        return []
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json={
+            "size": k,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"parent_document_id": parent_ids}},
+                        {"term": {"view_type": "table_row"}},
+                    ],
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["text^3", "row_text^4", "title^2"],
+                            }
+                        }
+                    ],
+                }
+            },
+        },
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
 def _hit_identity(hit: dict[str, Any]) -> str:
     src = hit.get("_source", {})
     return (
@@ -160,15 +219,65 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     out: list[RetrievedContext] = []
     for hit in hits:
         src = hit.get("_source", {})
+        text = src.get("text") or src.get("content") or src.get("pageContent", "")
         out.append(
             RetrievedContext(
-                document_id=src.get("document_id") or src.get("id") or hit.get("_id", ""),
-                text=src.get("text") or src.get("content") or src.get("pageContent", ""),
+                document_id=src.get("parent_document_id") or src.get("document_id") or src.get("id") or hit.get("_id", ""),
+                text=text,
                 title=src.get("title", ""),
                 score=hit.get("_score", 0),
             )
         )
     return out
+
+
+def _aggregate_table_contexts(
+    table_hits: list[dict[str, Any]],
+    row_hits: list[dict[str, Any]],
+    top_k: int,
+) -> list[RetrievedContext]:
+    table_meta: dict[str, tuple[str, float, str]] = {}
+    for hit in table_hits:
+        src = hit.get("_source", {})
+        parent_id = str(src.get("parent_document_id") or src.get("document_id") or "")
+        if not parent_id or parent_id in table_meta:
+            continue
+        table_meta[parent_id] = (
+            str(src.get("title", "")),
+            float(hit.get("_score", 0.0)),
+            str(src.get("table_schema", "")),
+        )
+
+    rows_by_parent: dict[str, list[str]] = {}
+    for hit in row_hits:
+        src = hit.get("_source", {})
+        parent_id = str(src.get("parent_document_id") or "")
+        if not parent_id:
+            continue
+        rows_by_parent.setdefault(parent_id, []).append(str(src.get("row_text") or src.get("text") or ""))
+
+    contexts: list[RetrievedContext] = []
+    for parent_id, (title, score, schema) in table_meta.items():
+        row_lines = rows_by_parent.get(parent_id, [])[:4]
+        if row_lines:
+            text = "TABLE_VIEW\n"
+            if schema:
+                text += f"SCHEMA: {schema}\n"
+            for idx, row in enumerate(row_lines, start=1):
+                text += f"ROW_{idx}: {row}\n"
+        else:
+            text = "TABLE_VIEW\n" + (f"SCHEMA: {schema}\n" if schema else "")
+        contexts.append(
+            RetrievedContext(
+                document_id=parent_id,
+                title=title,
+                text=text.strip(),
+                score=score,
+            )
+        )
+        if len(contexts) >= top_k:
+            break
+    return contexts
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -399,17 +508,23 @@ async def retrieve(
         retrieval_query = await _rewrite_retrieval_query(query)
         candidate_k = max(top_k * 3, top_k)
     try:
-        vector = (await asyncio.to_thread(embed_batch, [retrieval_query]))[0]
-        vector_hits = _es_vector_search(idx, vector, candidate_k)
+        table_hits = _es_table_search(idx, retrieval_query, candidate_k)
         title_hits = _es_title_search(idx, retrieval_query, candidate_k)
         text_hits = _es_text_search(idx, retrieval_query, candidate_k)
-        hits = _fuse_hits_rrf(title_hits, vector_hits, text_hits, k=top_k)
+        hits = _fuse_hits_rrf(table_hits, title_hits, text_hits, k=max(top_k * 2, top_k))
     except Exception:
         try:
             hits = _es_text_search(idx, retrieval_query, top_k)
         except Exception:
             return []
-    contexts = _hits_to_contexts(hits)
+    parent_ids = [
+        str(hit.get("_source", {}).get("parent_document_id") or hit.get("_source", {}).get("document_id") or "")
+        for hit in hits
+    ]
+    row_hits = _es_row_lookup(idx, [pid for pid in parent_ids if pid], retrieval_query, max(top_k * 4, top_k))
+    contexts = _aggregate_table_contexts(hits, row_hits, top_k)
+    if not contexts:
+        contexts = _hits_to_contexts(hits)
     try:
         return await _sentence_rerank_contexts(retrieval_query, contexts, top_k)
     except Exception:

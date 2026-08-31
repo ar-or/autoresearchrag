@@ -20,7 +20,7 @@ ERRLOG="/tmp/codex_loop_errors_$$.log"
 ITERATION=0
 
 cleanup() { rm -f "$LAST_MSG"; }
-abort()  { echo ""; err "Interrupted"; cleanup; kill 0; }
+abort()  { echo ""; err "Interrupted"; exit 130; }
 trap abort INT TERM
 trap cleanup EXIT
 
@@ -49,6 +49,9 @@ stream_and_capture() {
 run_codex() {
     local rc=0
     "$@" 2> >(tee -a "$ERRLOG" >&2) | stream_and_capture || rc=$?
+    if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+        return "$rc"
+    fi
     if [ "$rc" -ne 0 ]; then
         err "codex exited with code $rc"
         err "stderr tail:"
@@ -57,11 +60,24 @@ run_codex() {
     return "$rc"
 }
 
+run_or_exit() {
+    local rc=0
+    run_codex "$@" || rc=$?
+    if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+        echo ""
+        err "Interrupted"
+        exit 130
+    fi
+    if [ "$rc" -ne 0 ]; then
+        exit "$rc"
+    fi
+}
+
 info "stderr → $ERRLOG"
 info "codex loop (max $MAX_ITERATIONS iterations)"
 info "Iteration $((++ITERATION)) (initial)"
 
-run_codex codex exec --json -s danger-full-access "$INITIAL_PROMPT"
+run_or_exit codex exec --json -s danger-full-access "$INITIAL_PROMPT"
 
 while true; do
     if [ -f "$LAST_MSG" ] && grep -qi "$DONE_MARKER" "$LAST_MSG"; then
@@ -78,5 +94,5 @@ while true; do
 
     echo ""
     info "Iteration $((++ITERATION)) (resume)"
-    run_codex codex exec resume --last --json --dangerously-bypass-approvals-and-sandbox -o "$LAST_MSG" "$CONTINUE_MSG"
+    run_or_exit codex exec resume --last --json --dangerously-bypass-approvals-and-sandbox -o "$LAST_MSG" "$CONTINUE_MSG"
 done

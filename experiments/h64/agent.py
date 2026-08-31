@@ -414,6 +414,47 @@ async def retrieve(
         return contexts[:top_k]
 
 
+def _needs_live_data(query: str) -> bool:
+    lowered = query.lower()
+    cues = (
+        " today",
+        " current",
+        " currently",
+        " now",
+        " latest",
+        " right now",
+        " this year",
+        " current year",
+    )
+    wrapped = f" {lowered} "
+    return any(cue in wrapped for cue in cues)
+
+
+def _live_state_context(query: str) -> RetrievedContext:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "utc_timestamp": now.isoformat(),
+        "utc_date": now.date().isoformat(),
+        "utc_year": now.year,
+        "query": query,
+    }
+    return RetrievedContext(
+        document_id=f"live:{now.date().isoformat()}",
+        title="Live operational state",
+        text=(
+            "LIVE_STATE:\n"
+            f"- UTC timestamp: {payload['utc_timestamp']}\n"
+            f"- UTC date: {payload['utc_date']}\n"
+            f"- UTC year: {payload['utc_year']}\n"
+            "- Source: deterministic runtime clock\n"
+            f"- Triggered for query: {query}"
+        ),
+        score=10.0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool definition (mirrors createRetrievalTool)
 # ---------------------------------------------------------------------------
@@ -427,6 +468,21 @@ _SEARCH_TOOL = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+_LIVE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_live_state",
+        "description": "Return deterministic live runtime state such as the current UTC date and year for time-sensitive questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Original user question"},
             },
             "required": ["query"],
         },
@@ -450,6 +506,16 @@ async def _handle_tool_call(name: str, arguments: str) -> tuple[str, list[Retrie
             for i, r in enumerate(results)
         ]
         return json.dumps(payload), results
+    if name == "get_live_state":
+        args = json.loads(arguments)
+        query = args.get("query", "")
+        context = _live_state_context(query)
+        payload = {
+            "title": context.title,
+            "text": context.text,
+            "document_id": context.document_id,
+        }
+        return json.dumps(payload), [context]
     return "[]", []
 
 
@@ -467,6 +533,8 @@ async def _run_agent(
     # 1. Pre-retrieval (always retrieve before agent runs)
     print(f"    [search] {user_message[:200]}")
     contexts = await retrieve(user_message)
+    if _needs_live_data(user_message):
+        contexts = [_live_state_context(user_message)] + contexts
     print(f"    [results] {len(contexts)} hits: {[c.title for c in contexts]}")
 
     # 2. Augment user message with retrieved context
@@ -489,14 +557,20 @@ async def _run_agent(
     max_iterations = 10
     trace = [_trace_step(user_message, contexts, contexts, 0.0)]
     allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
+    allow_live = _needs_live_data(user_message)
 
     for _ in range(max_iterations):
         request_kwargs: dict[str, Any] = {
             "model": MODEL,
             "messages": messages,
         }
+        tools: list[dict[str, Any]] = []
         if allow_search:
-            request_kwargs["tools"] = [_SEARCH_TOOL]
+            tools.append(_SEARCH_TOOL)
+        if allow_live:
+            tools.append(_LIVE_TOOL)
+        if tools:
+            request_kwargs["tools"] = tools
         resp = await _openai.chat.completions.create(
             **request_kwargs,  # type: ignore[arg-type]
         )
@@ -540,6 +614,7 @@ async def _run_agent(
                 )
             )
             allow_search = _should_continue_with_q_lambda_proxy(user_message, trace)
+            allow_live = False
             continue
 
         # Done — extract content

@@ -219,11 +219,28 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
                 document_id=src.get("document_id") or src.get("id") or hit.get("_id", ""),
                 text=src.get("text") or src.get("content") or src.get("pageContent", ""),
                 title=src.get("title", ""),
-                score=hit.get("_score", 0),
+                score=float(hit.get("_score") or 0.0),
                 chunk_index=int(src.get("chunk_index", 0) or 0),
             )
         )
     return out
+
+
+def _dedupe_contexts(
+    contexts: list[RetrievedContext],
+    limit: int,
+) -> list[RetrievedContext]:
+    deduped: list[RetrievedContext] = []
+    seen: set[tuple[str, int, str]] = set()
+    for context in contexts:
+        key = (context.document_id, context.chunk_index, context.lookup_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 async def retrieve(
@@ -330,6 +347,13 @@ def _read_payload(contexts: list[RetrievedContext]) -> str:
     )
 
 
+def _sort_read_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+    return sorted(
+        contexts,
+        key=lambda context: (context.document_id, context.chunk_index, -context.score),
+    )
+
+
 def _es_chunk_neighbors(index: str, document_id: str, chunk_index: int) -> list[dict[str, Any]]:
     target_indices = [chunk_index - 1, chunk_index + 1]
     r = _requests.post(
@@ -396,8 +420,10 @@ async def _handle_tool_call(
                     "message": "Requested chunks were already opened earlier in the conversation.",
                 }
             ), state.read_results
-        deduped = _dedupe_contexts(opened, RETRIEVAL_K * 2)
-        state.read_results = _dedupe_contexts(state.read_results + deduped, RETRIEVAL_K * 2)
+        deduped = _sort_read_contexts(_dedupe_contexts(opened, RETRIEVAL_K * 2))
+        state.read_results = _sort_read_contexts(
+            _dedupe_contexts(state.read_results + deduped, RETRIEVAL_K * 2)
+        )
         payload = {
             "status": "ok",
             "already_read": already_read,
@@ -435,6 +461,7 @@ async def _run_agent(
         augmented = (
             "Search results:\n"
             f"{block}\n\n"
+            "Use exactly one tool call per turn. "
             "Use read_documents on promising lookup_ids before relying on a result. "
             "Set include_neighbors=true when you need adjacent context.\n\n"
             f"User question: {user_message}"
@@ -455,6 +482,7 @@ async def _run_agent(
             model=MODEL,
             messages=messages,  # type: ignore[arg-type]
             tools=[_SEARCH_TOOL, _READ_TOOL],  # type: ignore[list-item]
+            parallel_tool_calls=False,
         )
         choice = resp.choices[0]
 
@@ -470,22 +498,29 @@ async def _run_agent(
         # If the model wants to call tools, execute them and continue
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
             messages.append(choice.message.model_dump())  # type: ignore[arg-type]
-            for tc in choice.message.tool_calls:
-                tool_output, tool_contexts = await _handle_tool_call(
-                    tc.function.name,
-                    tc.function.arguments,
-                    retrieval_state,
-                    ELASTIC_INDEX,
-                )
-                if tc.function.name == "read_documents":
-                    contexts = list(retrieval_state.read_results)
-                elif tc.function.name == "search_documents":
-                    contexts = list(retrieval_state.search_results.values())
+            tc = choice.message.tool_calls[0]
+            tool_output, tool_contexts = await _handle_tool_call(
+                tc.function.name,
+                tc.function.arguments,
+                retrieval_state,
+                ELASTIC_INDEX,
+            )
+            if tc.function.name == "read_documents":
+                contexts = list(retrieval_state.read_results)
+            elif tc.function.name == "search_documents":
+                contexts = list(retrieval_state.search_results.values())
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_output,
+                }
+            )
+            if len(choice.message.tool_calls) > 1:
                 messages.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": tool_output,
+                        "role": "system",
+                        "content": "Only one tool call is allowed per turn in this ReAct loop. Continue with a single next action.",
                     }
                 )
             continue

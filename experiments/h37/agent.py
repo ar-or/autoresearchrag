@@ -218,11 +218,28 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
                 document_id=src.get("document_id") or src.get("id") or hit.get("_id", ""),
                 text=src.get("text") or src.get("content") or src.get("pageContent", ""),
                 title=src.get("title", ""),
-                score=hit.get("_score", 0),
+                score=float(hit.get("_score") or 0.0),
                 chunk_index=int(src.get("chunk_index", 0) or 0),
             )
         )
     return out
+
+
+def _dedupe_contexts(
+    contexts: list[RetrievedContext],
+    limit: int,
+) -> list[RetrievedContext]:
+    deduped: list[RetrievedContext] = []
+    seen: set[tuple[str, int, str]] = set()
+    for context in contexts:
+        key = (context.document_id, context.chunk_index, context.lookup_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 async def retrieve(
@@ -329,6 +346,13 @@ def _read_payload(contexts: list[RetrievedContext]) -> str:
     )
 
 
+def _sort_read_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+    return sorted(
+        contexts,
+        key=lambda context: (context.document_id, context.chunk_index, -context.score),
+    )
+
+
 def _es_chunk_neighbors(index: str, document_id: str, chunk_index: int) -> list[dict[str, Any]]:
     target_indices = [chunk_index - 1, chunk_index + 1]
     r = _requests.post(
@@ -379,7 +403,7 @@ async def _handle_tool_call(
             if include_neighbors:
                 neighbor_hits = _es_chunk_neighbors(index, context.document_id, context.chunk_index)
                 opened.extend(_hits_to_contexts(neighbor_hits))
-        deduped = _dedupe_contexts(opened, RETRIEVAL_K * 2)
+        deduped = _sort_read_contexts(_dedupe_contexts(opened, RETRIEVAL_K * 2))
         state.read_results = deduped
         return _read_payload(deduped), deduped
     return "[]", []

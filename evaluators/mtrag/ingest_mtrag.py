@@ -11,6 +11,7 @@ Usage:
 
 import hashlib
 import json
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -22,13 +23,18 @@ load_dotenv(PROJECT_ROOT / ".env")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.ingest import (
+    chunk_text,
     ensure_ingest_ready,
     ingest_prepared_items,
-    prepare_document,
+    prepare_document_chunks,
 )
 
 CORPORA_DIR = Path(__file__).resolve().parent / "data" / "mt-rag-benchmark" / "corpora" / "passage_level"
 ALL_DOMAINS = ["clapnq", "cloud", "fiqa", "govt"]
+MTRAG_INDEX_COLLECTION_NAME = os.environ.get("MTRAG_INDEX_COLLECTION_NAME", "mycollection3")
+MTRAG_MAX_PASSAGE_CHARS = int(os.environ.get("MTRAG_MAX_PASSAGE_CHARS", "8000"))
+MTRAG_START_LINE = int(os.environ.get("MTRAG_START_LINE", "1"))
+MTRAG_END_LINE = int(os.environ.get("MTRAG_END_LINE", "0"))
 
 
 def _prepare_passage(args: tuple[str, dict]):
@@ -40,15 +46,22 @@ def _prepare_passage(args: tuple[str, dict]):
     title = passage.get("title", "")
     passage_id = passage.get("_id", passage.get("id", ""))
     doc_id = hashlib.sha256(passage_id.encode()).hexdigest()[:16]
-    return prepare_document(
-        text=text,
+    chunks = [text]
+    if len(text) > MTRAG_MAX_PASSAGE_CHARS:
+        # A small number of "passage" records are still too large for one embedding call.
+        # Split only those outliers while keeping the same document_id so qrel matching still works.
+        chunks = chunk_text(text, chunk_size=MTRAG_MAX_PASSAGE_CHARS, overlap=0)
+    # passage_level corpora are already benchmark passage units. Keep them one-to-one by default,
+    # and only split rare oversized outliers while preserving the same document_id.
+    return prepare_document_chunks(
+        chunks=chunks,
         hash_key=doc_id,
         fields={
             "title": title,
             "source": f"mtrag:{domain}:{passage_id}",
             "document_id": doc_id,
             "doc_name": title or passage_id,
-            "collection_name": "mycollection3",
+            "collection_name": MTRAG_INDEX_COLLECTION_NAME,
         },
     )
 
@@ -66,7 +79,12 @@ def ingest_domain(domain: str):
     with zipfile.ZipFile(zip_path) as zf:
         jsonl_name = zf.namelist()[0]
         with zf.open(jsonl_name) as f:
-            items = ((domain, json.loads(line)) for line in f)
+            items = (
+                (domain, json.loads(line))
+                for line_number, line in enumerate(f, start=1)
+                if line_number >= MTRAG_START_LINE
+                and (MTRAG_END_LINE <= 0 or line_number <= MTRAG_END_LINE)
+            )
             total_chunks, total_errors = ingest_prepared_items(
                 items,
                 _prepare_passage,
@@ -91,6 +109,9 @@ def main():
 
     for domain in domains:
         print(f"\nIngesting domain: {domain}")
+        if MTRAG_START_LINE > 1 or MTRAG_END_LINE > 0:
+            end_label = "end" if MTRAG_END_LINE <= 0 else str(MTRAG_END_LINE)
+            print(f"  Line range: {MTRAG_START_LINE}..{end_label}")
         ok, errs = ingest_domain(domain)
         grand_total += ok
         grand_errors += errs

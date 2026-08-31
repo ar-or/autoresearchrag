@@ -21,6 +21,8 @@ from scripts import embed_cache
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIMS = 1536
+EMBED_MAX_REQUEST_ITEMS = int(os.environ.get("EMBED_MAX_REQUEST_ITEMS", "64"))
+EMBED_MAX_REQUEST_CHARS = int(os.environ.get("EMBED_MAX_REQUEST_CHARS", "24000"))
 
 _client: OpenAI | None = None
 
@@ -30,6 +32,33 @@ def _get_client() -> OpenAI:
     if _client is None:
         _client = OpenAI()
     return _client
+
+
+def _chunk_embedding_inputs(texts: list[str]) -> list[list[str]]:
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_chars = 0
+
+    for text in texts:
+        text_chars = max(len(text), 1)
+        should_flush = (
+            current_batch
+            and (
+                len(current_batch) >= EMBED_MAX_REQUEST_ITEMS
+                or current_chars + text_chars > EMBED_MAX_REQUEST_CHARS
+            )
+        )
+        if should_flush:
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append(text)
+        current_chars += text_chars
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
 
 
 def embed_batch(texts: list[str], max_retries: int = 3) -> list[list[float]]:
@@ -47,19 +76,21 @@ def embed_batch(texts: list[str], max_retries: int = 3) -> list[list[float]]:
 
     if uncached_indices:
         uncached_texts = [texts[i] for i in uncached_indices]
-        for attempt in range(1, max_retries + 1):
-            try:
-                resp = _get_client().embeddings.create(input=uncached_texts, model=EMBED_MODEL)
-                break
-            except Exception as e:
-                if attempt == max_retries:
-                    raise RuntimeError(
-                        f"Embedding API failed after {max_retries} attempts: {e}"
-                    ) from e
-                wait = 2 ** attempt
-                print(f"  Embedding API error (attempt {attempt}/{max_retries}): {e}. Retrying in {wait}s...")
-                time.sleep(wait)
-        new_embeddings = [d.embedding for d in resp.data]
+        new_embeddings = []
+        for request_batch in _chunk_embedding_inputs(uncached_texts):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    resp = _get_client().embeddings.create(input=request_batch, model=EMBED_MODEL)
+                    break
+                except Exception as e:
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"Embedding API failed after {max_retries} attempts: {e}"
+                        ) from e
+                    wait = 2 ** attempt
+                    print(f"  Embedding API error (attempt {attempt}/{max_retries}): {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+            new_embeddings.extend(d.embedding for d in resp.data)
         pairs = []
         for idx, emb in zip(uncached_indices, new_embeddings):
             results[idx] = emb

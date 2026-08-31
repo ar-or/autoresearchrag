@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,10 @@ from typing import Any
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 LOCAL_AGENT_TIMEOUT_S = float(os.environ.get("LOCAL_AGENT_TIMEOUT_S", "900"))
+
+
+def _split_env_csv(name: str) -> list[str]:
+    return [part.strip() for part in os.environ.get(name, "").split(",") if part.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +66,10 @@ class AgentClient(ABC):
 
     @abstractmethod
     def delete_session(self, session_id: str) -> None: ...
+
+    def seed_session_messages(self, session_id: str, messages: list[dict[str, str]]) -> bool:
+        del session_id, messages
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +140,67 @@ class LocalAgentClient(AgentClient):
 
         module_name = os.environ.get("AGENT_MODULE", "agent")
         self._agent = importlib.import_module(module_name)
+        self._patch_search_filters()
+
+    def _patch_search_filters(self) -> None:
+        source_prefixes = _split_env_csv("MTRAG_ALLOWED_SOURCE_PREFIXES")
+        collection_names = _split_env_csv("MTRAG_ALLOWED_COLLECTION_NAMES")
+        if not source_prefixes and not collection_names:
+            return
+
+        candidates = [self._agent]
+        for name in ("agent", "experiments.graph_agent_common"):
+            module = sys.modules.get(name)
+            if module is not None and module not in candidates:
+                candidates.append(module)
+
+        def allowed(hit: dict[str, Any]) -> bool:
+            source = str(hit.get("_source", {}).get("source", "") or "")
+            collection = str(hit.get("_source", {}).get("collection_name", "") or "")
+            if source_prefixes and not any(source.startswith(prefix) for prefix in source_prefixes):
+                return False
+            if collection_names and collection not in collection_names:
+                return False
+            return True
+
+        for module in candidates:
+            if getattr(module, "_mtrag_eval_filter_patched", False):
+                continue
+
+            vector_search = getattr(module, "_es_vector_search", None)
+            if callable(vector_search):
+                def wrapped_vector_search(index: str, vector: list[float], k: int, _orig=vector_search):
+                    hits = _orig(index, vector, max(k * 6, k))
+                    return [hit for hit in hits if allowed(hit)][:k]
+
+                setattr(module, "_es_vector_search", wrapped_vector_search)
+
+            text_search = getattr(module, "_es_text_search", None)
+            if callable(text_search):
+                def wrapped_text_search(index: str, query: str, k: int, _orig=text_search):
+                    hits = _orig(index, query, max(k * 6, k))
+                    return [hit for hit in hits if allowed(hit)][:k]
+
+                setattr(module, "_es_text_search", wrapped_text_search)
+
+            setattr(module, "_mtrag_eval_filter_patched", True)
 
     def create_session(self) -> str:
         return self._agent.create_session()
+
+    def seed_session_messages(self, session_id: str, messages: list[dict[str, str]]) -> bool:
+        add_message = getattr(self._agent, "_add_message", None)
+        chat_message_cls = getattr(self._agent, "ChatMessage", None)
+        if not callable(add_message) or chat_message_cls is None:
+            return False
+
+        for message in messages:
+            role = message.get("role", "")
+            content = message.get("content", "")
+            if role not in {"user", "assistant"} or not content:
+                continue
+            add_message(session_id, chat_message_cls(role=role, content=content))
+        return True
 
     def send_message(self, session_id: str, message: str) -> AgentResponse:
         import asyncio

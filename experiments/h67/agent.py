@@ -112,6 +112,33 @@ def _es_text_search(
     return r.json().get("hits", {}).get("hits", [])
 
 
+def _es_taxonomy_search(index: str, query: str, k: int) -> list[dict[str, Any]]:
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json={
+            "size": k,
+            "query": {
+                "bool": {
+                    "filter": [{"term": {"view_type": "taxonomy_enriched"}}],
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["title^2", "text^3", "taxonomy_labels^4", "hierarchy_path^4"],
+                            }
+                        }
+                    ],
+                }
+            },
+        },
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
 def _hit_identity(hit: dict[str, Any]) -> str:
     src = hit.get("_source", {})
     return (
@@ -147,7 +174,7 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
         src = hit.get("_source", {})
         out.append(
             RetrievedContext(
-                document_id=src.get("document_id") or src.get("id") or hit.get("_id", ""),
+                document_id=src.get("parent_document_id") or src.get("document_id") or src.get("id") or hit.get("_id", ""),
                 text=src.get("text") or src.get("content") or src.get("pageContent", ""),
                 title=src.get("title", ""),
                 score=hit.get("_score", 0),
@@ -363,7 +390,27 @@ def _question_taxonomy_terms(query: str) -> str:
         labels.extend(["comparison", "bridge"])
     if lowered.startswith("is ") or lowered.startswith("was "):
         labels.append("yes no")
+    if any(token in lowered for token in ("capital", "city", "river", "country")):
+        labels.extend(["geography", "location"])
+    if any(token in lowered for token in ("born", "died", "married", "played", "wrote")):
+        labels.extend(["biography", "person"])
     return " ".join(labels)
+
+
+def _decompose_query(query: str) -> list[str]:
+    lowered = query.lower()
+    parts = [query]
+    if " both " in lowered and " and " in lowered:
+        parts.extend(part.strip(" ?") for part in re.split(r"\band\b", query) if len(part.split()) >= 3)
+    elif " before " in lowered or " after " in lowered:
+        parts.extend(part.strip(" ?") for part in re.split(r"\bbefore\b|\bafter\b", query) if len(part.split()) >= 3)
+    elif " or " in lowered:
+        parts.extend(part.strip(" ?") for part in re.split(r"\bor\b", query) if len(part.split()) >= 3)
+    deduped: list[str] = []
+    for part in parts:
+        if part and part not in deduped:
+            deduped.append(part)
+    return deduped[:3]
 
 
 async def _rewrite_retrieval_query(query: str) -> str:
@@ -404,7 +451,12 @@ async def retrieve(
         vector = (await asyncio.to_thread(embed_batch, [taxonomy_query]))[0]
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, taxonomy_query, candidate_k)
-        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
+        taxonomy_hits = _es_taxonomy_search(idx, taxonomy_query, candidate_k)
+        subquery_hits: list[list[dict[str, Any]]] = []
+        for subquery in _decompose_query(query)[1:]:
+            expanded = f"{subquery} {_question_taxonomy_terms(subquery)}".strip()
+            subquery_hits.append(_es_taxonomy_search(idx, expanded, top_k))
+        hits = _fuse_hits_rrf(taxonomy_hits, vector_hits, text_hits, *subquery_hits, k=max(top_k * 2, top_k))
     except Exception:
         try:
             hits = _es_text_search(idx, taxonomy_query, top_k)

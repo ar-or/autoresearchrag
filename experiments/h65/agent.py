@@ -112,6 +112,77 @@ def _es_text_search(
     return r.json().get("hits", {}).get("hits", [])
 
 
+def _es_card_search(index: str, query: str, k: int) -> list[dict[str, Any]]:
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json={
+            "size": k,
+            "query": {
+                "bool": {
+                    "filter": [{"term": {"view_type": "knowledge_card"}}],
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": [
+                                    "title^2",
+                                    "text^3",
+                                    "problem^4",
+                                    "cause^4",
+                                    "evidence^3",
+                                    "resolution^4",
+                                    "card_terms^2",
+                                ],
+                            }
+                        }
+                    ],
+                }
+            },
+        },
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
+def _es_support_lookup(
+    index: str,
+    parent_ids: list[str],
+    k: int,
+) -> list[dict[str, Any]]:
+    if not parent_ids:
+        return []
+    r = _requests.post(
+        f"{ELASTIC_URL}/{index}/_search",
+        headers=_es_headers(),
+        json={
+            "size": k,
+            "query": {
+                "bool": {
+                    "should": [
+                        {
+                            "bool": {
+                                "filter": [
+                                    {"terms": {"parent_document_id": parent_ids}},
+                                    {"term": {"view_type": "raw_support"}},
+                                ]
+                            }
+                        },
+                        {"terms": {"document_id": parent_ids}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+        },
+        timeout=ELASTIC_TIMEOUT_S,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("hits", {}).get("hits", [])
+
+
 def _hit_identity(hit: dict[str, Any]) -> str:
     src = hit.get("_source", {})
     return (
@@ -146,18 +217,19 @@ def _hits_to_contexts(hits: list[dict[str, Any]]) -> list[RetrievedContext]:
     for hit in hits:
         src = hit.get("_source", {})
         text = src.get("text") or src.get("content") or src.get("pageContent", "")
-        sentences = _split_sentences(text)
-        card_lines = [
-            f"CARD_TITLE: {src.get('title', '')}",
-            f"KEY_FACT_1: {sentences[0] if sentences else text[:180]}",
-        ]
-        if len(sentences) > 1:
-            card_lines.append(f"KEY_FACT_2: {sentences[1]}")
-        if len(sentences) > 2:
-            card_lines.append(f"KEY_FACT_3: {sentences[2]}")
+        if src.get("view_type") == "knowledge_card":
+            card_lines = [text]
+        else:
+            sentences = _split_sentences(text)
+            card_lines = [
+                f"SUPPORT_TITLE: {src.get('title', '')}",
+                f"SUPPORT_FACT_1: {sentences[0] if sentences else text[:180]}",
+            ]
+            if len(sentences) > 1:
+                card_lines.append(f"SUPPORT_FACT_2: {sentences[1]}")
         out.append(
             RetrievedContext(
-                document_id=src.get("document_id") or src.get("id") or hit.get("_id", ""),
+                document_id=src.get("parent_document_id") or src.get("document_id") or src.get("id") or hit.get("_id", ""),
                 text="\n".join(card_lines),
                 title=src.get("title", ""),
                 score=hit.get("_score", 0),
@@ -397,17 +469,37 @@ async def retrieve(
         vector = (await asyncio.to_thread(embed_batch, [retrieval_query]))[0]
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, retrieval_query, candidate_k)
-        hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
+        card_hits = _es_card_search(idx, retrieval_query, candidate_k)
+        hits = _fuse_hits_rrf(card_hits, vector_hits, text_hits, k=max(top_k * 2, top_k))
     except Exception:
         try:
             hits = _es_text_search(idx, retrieval_query, top_k)
         except Exception:
             return []
-    contexts = _hits_to_contexts(hits)
+    parent_ids = [
+        hit.get("_source", {}).get("parent_document_id")
+        or hit.get("_source", {}).get("document_id")
+        for hit in hits
+    ]
+    parent_ids = [str(parent_id) for parent_id in parent_ids if parent_id][:top_k]
+    support_hits = _es_support_lookup(idx, parent_ids, max(top_k, len(parent_ids)))
+    contexts = _hits_to_contexts(hits + support_hits)
     try:
-        return await _sentence_rerank_contexts(retrieval_query, contexts, top_k)
+        reranked = await _sentence_rerank_contexts(retrieval_query, contexts, max(top_k * 2, top_k))
     except Exception:
-        return contexts[:top_k]
+        reranked = contexts[: max(top_k * 2, top_k)]
+
+    deduped: list[RetrievedContext] = []
+    seen: set[tuple[str, str, str]] = set()
+    for context in reranked:
+        key = _context_signature(context)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+        if len(deduped) >= top_k:
+            break
+    return deduped
 
 
 # ---------------------------------------------------------------------------

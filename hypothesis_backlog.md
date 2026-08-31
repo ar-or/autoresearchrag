@@ -1216,7 +1216,7 @@ Implementation sketch
 - Approximate Token-Guard with API-visible signals only: token logprobs if available, otherwise sentence- or clause-level self-check prompts and sampled agreement.
 - Split the answer into short spans, score each span for support and logical consistency against the retrieved context, and regenerate only the weakest spans inside a local window.
 - Allow at most one global retry after local repairs so cost stays bounded.
-- Paper source: [Token-Guard: Towards Token-Level Hallucination Control via Self-Checking Decoding](https://arxiv.org/abs/2601.21969)
+- Paper source: [Token-Guard: Towards Token-Level Hallucination Control via Self-Checking Decoding](https://arxiv.org/html/2601.21969v2)
 
 Expected upside
 - Local repair can preserve the strong parts of an answer while focusing correction budget on the spans most likely to hallucinate.
@@ -1348,3 +1348,329 @@ Main risk
 
 Judge focus
 - Measure groundedness and factual support rates together with answer completeness and fluency.
+
+### Requested 2026-03 API-Compatible Additions
+
+Repository note
+- The cards below keep only techniques that are testable with API-accessible models and the current corpora. Fine-tuning-only variants, hidden-state-only controls, and logprobe-dependent methods are omitted or converted into prompt-level approximations.
+
+## H69: AlignRAG Evidence-Grounded Critique Loop
+
+Hypothesis
+- A retrieval-aware critique pass that identifies evidence-misaligned reasoning and rewrites the answer will improve groundedness and multi-hop accuracy over single-pass RAG.
+
+Implementation sketch
+- Generate a first draft answer from the retrieved evidence.
+- Ask a structured critic prompt to flag unsupported reasoning steps, missing bridge facts, and evidence misuse, then produce a short evidence-grounded revision plan.
+- Run one or two revise passes using that plan before finalizing the answer.
+- Paper source: [Retrieval is Not Enough: Enhancing RAG Reasoning through Test-Time Critique and Optimization](https://arxiv.org/html/2504.14858v4)
+
+Expected upside
+- AlignRAG shows that critique-guided test-time refinement can improve reasoning fidelity even when the retrieval set is unchanged.
+
+Main risk
+- The critique can become generic or self-affirming, adding cost without materially correcting the answer.
+
+Judge focus
+- Check whether revisions remove unsupported claims and fix missing bridge facts rather than merely restyling the answer.
+
+## H70: Phase-Aware Misalignment Router
+
+Hypothesis
+- Classifying failures into retrieval relevance, query-evidence mapping, or evidence-synthesis errors and routing each case to a different recovery action will outperform a single generic retry rule.
+
+Implementation sketch
+- After the first draft, ask the critic to assign one dominant failure type: `relevance`, `mapping`, or `synthesis`.
+- If the issue is `relevance`, expand or rerank retrieval; if `mapping`, generate a targeted bridge query; if `synthesis`, revise the answer without new retrieval.
+- Compare this routed recovery policy against a generic one-size-fits-all self-reflection pass.
+- Paper source: [Retrieval is Not Enough: Enhancing RAG Reasoning through Test-Time Critique and Optimization](https://arxiv.org/html/2504.14858v4)
+
+Expected upside
+- The paper frames RAG failure as multi-stage misalignment, so targeted recovery may fix more errors with fewer wasted retries.
+
+Main risk
+- Misclassification can send the system down the wrong recovery path and amplify failure.
+
+Judge focus
+- Compare retry count, latency, and whether each route actually fixes the failure mode it was assigned.
+
+## H71: Dynamic Critique Stopping
+
+Hypothesis
+- A structured `GOOD` or `BAD` critic verdict can stop critique loops early and retain most of the gains of iterative refinement without fixed extra calls on every query.
+
+Implementation sketch
+- Require the critic output to begin with a bounded verdict token and one-sentence justification.
+- Stop refinement when the verdict is `GOOD` or the groundedness score crosses a threshold; otherwise allow one additional revise pass.
+- Log stop rates by benchmark family and question type.
+- Paper source: [Retrieval is Not Enough: Enhancing RAG Reasoning through Test-Time Critique and Optimization](https://arxiv.org/html/2504.14858v4)
+
+Expected upside
+- AlignRAG-auto reports that dynamic stopping can preserve accuracy while reducing unnecessary refinement steps.
+
+Main risk
+- Poorly calibrated verdicts can halt too early on subtle errors or loop on already-good answers.
+
+Judge focus
+- Measure answer quality together with average calls per query, not quality alone.
+
+## H72: Dual Reconstruction Answer Reranker
+
+Hypothesis
+- Among multiple answer candidates, the one that best reconstructs masked query constraints from the answer plus known query context will be more reliable than the highest-likelihood candidate.
+
+Implementation sketch
+- Sample two to four answer candidates for the same question.
+- Decompose the question into known anchors and unknown target slots, then build dual prompts that reconstruct the unknown slots from each candidate answer plus the known anchors.
+- Score candidates by reconstruction fidelity and use the best one, or abstain if none reconstruct cleanly.
+- Paper source: [DuPO: Enabling Reliable LLM Self-Verification via Dual Preference Optimization](https://arxiv.org/abs/2508.14460)
+
+Expected upside
+- The paper reports strong gains from inference-time reranking, which makes this the most direct API-compatible DuPO derivative.
+
+Main risk
+- Reconstruction prompts can reward verbose candidates that leak clues without being truly correct.
+
+Judge focus
+- Compare candidate-selection win rate, final accuracy, and extra compute cost versus single-candidate decoding.
+
+## H73: Known-Unknown Query Decomposition Checks
+
+Hypothesis
+- Explicitly decomposing each question into known and unknown components before retrieval and again during verification will preserve bridge constraints better than free-form query rewriting.
+
+Implementation sketch
+- Extract known anchors such as entities, time constraints, relation frame, and answer type, plus unknown target slots.
+- Use the anchors to guide retrieval and use the target slots to define a post-answer consistency check that reconstructs what the answer was supposed to resolve.
+- If one slot fails reconstruction, trigger a targeted follow-up retrieval only for that missing slot.
+- Paper source: [DuPO: Enabling Reliable LLM Self-Verification via Dual Preference Optimization](https://arxiv.org/abs/2508.14460)
+
+Expected upside
+- DuPO’s generalized duality gives a concrete structure for self-verification instead of generic self-reflection.
+
+Main risk
+- Slot extraction can be brittle on comparison, yes-no, or heavily compositional questions.
+
+Judge focus
+- Inspect whether bridge facts, time constraints, and target entities are preserved across retrieval and answer generation.
+
+## H74: EIRE Semantic Retrieval Profile
+
+Hypothesis
+- Extracting explicit entity, intent, relation, and evidence expectations from the query and scoring candidates against that profile will improve retrieval precision and groundedness.
+
+Implementation sketch
+- Use a short LLM parser to derive an `EIRE` profile from the user query.
+- Score retrieved chunks by semantic agreement with those fields before final top-`k` selection.
+- Use profile mismatch as a reranking penalty instead of relying only on dense or lexical similarity.
+- Paper source: [SeCon-RAG: Stemming Hallucination in RAG Systems via Semantic and Conflict Filtering](https://arxiv.org/abs/2510.09710)
+
+Expected upside
+- SeCon-RAG argues that early semantic misalignment is a major driver of hallucinated downstream synthesis.
+
+Main risk
+- Profile extraction errors can suppress semantically correct but differently phrased evidence.
+
+Judge focus
+- Check false negatives on paraphrased evidence and whether retrieval precision improves enough to help the final answer.
+
+## H75: EIRE-Gated Clean Pool Admission
+
+Hypothesis
+- Building a cleaner second-stage candidate pool by clustering retrieved chunks and retaining only EIRE-consistent clusters will beat flat top-`k` truncation on noisy or distractor-heavy questions.
+
+Implementation sketch
+- Retrieve a wider candidate pool.
+- Cluster similar chunks or group them by document, then keep only clusters with strong EIRE alignment and reasonable source diversity.
+- Feed the cleaned pool into the existing answer step without changing generation prompts.
+- Paper source: [SeCon-RAG: Stemming Hallucination in RAG Systems via Semantic and Conflict Filtering](https://arxiv.org/abs/2510.09710)
+
+Expected upside
+- This tests the paper’s two-stage filtering idea in a way that fits the current pipeline.
+
+Main risk
+- Important minority evidence can sit in a small cluster and get dropped by the cleaner.
+
+Judge focus
+- Compare bridge-fact recall, evidence diversity, and contradiction rate in the final prompt.
+
+## H76: Conflict-Free Evidence Filter
+
+Hypothesis
+- Removing or downweighting retrieved chunks that contradict the query’s semantic profile or the dominant evidence set will reduce hallucinated synthesis and improve abstention quality.
+
+Implementation sketch
+- After retrieval, compare candidate chunks for contradiction against the query profile and against each other.
+- Suppress conflicting chunks or split them into competing evidence bundles that force abstention or targeted follow-up retrieval.
+- Keep the final answer step blind to rejected chunks so contradictory evidence cannot leak back into generation.
+- Paper source: [SeCon-RAG: Stemming Hallucination in RAG Systems via Semantic and Conflict Filtering](https://arxiv.org/abs/2510.09710)
+
+Expected upside
+- SeCon-RAG’s second stage directly targets conflict-induced hallucinations rather than only relevance.
+
+Main risk
+- Real ambiguity can be mistaken for noise, lowering answer completeness.
+
+Judge focus
+- Measure contradiction handling, abstention precision, and whether completeness drops on legitimately ambiguous questions.
+
+## H77: Licensed Claim Emission
+
+Hypothesis
+- Requiring each answer claim to be licensed by a structured support fact or extracted triple before emission will sharply reduce false positives on factoid and multi-hop QA.
+
+Implementation sketch
+- Convert retrieved evidence into lightweight structured facts or triples during retrieval or prompt preprocessing.
+- Extract atomic claims from the draft answer and validate each one against the structured evidence set.
+- Emit only licensed claims, otherwise revise or abstain.
+- Paper source: [Stemming Hallucination in Language Models Using a Licensing Oracle](https://arxiv.org/abs/2511.06073)
+
+Expected upside
+- The Licensing Oracle shows that deterministic validation can outperform plain RAG when the domain has enough structure to support licensing.
+
+Main risk
+- Fact extraction or normalization can miss valid support and over-trigger abstention.
+
+Judge focus
+- Track false-answer rate, abstention precision, and claim coverage instead of relying on EM alone.
+
+## H78: Oracle-Backed Abstention Gate
+
+Hypothesis
+- A final abstention decision based on licensed-claim coverage will outperform confidence-only refusal heuristics when evidence is incomplete or contradictory.
+
+Implementation sketch
+- Require a minimum licensed-claim coverage threshold before the system is allowed to answer.
+- If key claim slots remain unlicensed, return an explicit `INSUFFICIENT_EVIDENCE` response instead of a low-confidence guess.
+- Tune thresholds separately for entity, binary, and comparison questions.
+- Paper source: [Stemming Hallucination in Language Models Using a Licensing Oracle](https://arxiv.org/abs/2511.06073)
+
+Expected upside
+- The paper reports perfect abstention precision and zero false answers, which makes abstention quality the most interesting transferable idea.
+
+Main risk
+- A conservative gate can suppress partially answerable questions and reduce exact-match metrics.
+
+Judge focus
+- Evaluate false-answer rate and abstention precision alongside the usual answer metrics.
+
+## H79: Clause-Level Acceptance and Repair
+
+Hypothesis
+- Scoring answer clauses by support, local coherence, and overall context alignment, then repairing only the mid-confidence clauses, will outperform whole-answer retries.
+
+Implementation sketch
+- Draft the answer as short clauses or sentences.
+- Score each clause with prompt-based support and coherence checks, mirroring Token-Guard’s accept-refine-discard segment logic without hidden-state access.
+- Accept strong clauses, locally repair middle-band clauses, and discard weak ones before final assembly.
+- Paper source: [Token-Guard: Towards Token-Level Hallucination Control via Self-Checking Decoding](https://arxiv.org/html/2601.21969v2)
+
+Expected upside
+- This preserves the good parts of an answer while focusing correction budget on the weakest factual spans.
+
+Main risk
+- Clause boundaries may not align with the true dependency structure of the answer.
+
+Judge focus
+- Compare unsupported-span rate, edit locality, and token cost rather than only final exact match.
+
+## H80: Global Answer Chain Selection
+
+Hypothesis
+- Building the final answer from the most mutually coherent supported clauses across one or more drafts, with abstention when the global chain score stays low, will improve grounded multi-step answers.
+
+Implementation sketch
+- Sample two or three compact drafts or repaired clause sets.
+- Re-rank clause chains by support coverage and inter-clause coherence.
+- Return the best chain if it clears a threshold, otherwise abstain or trigger one targeted retrieval retry.
+- Paper source: [Token-Guard: Towards Token-Level Hallucination Control via Self-Checking Decoding](https://arxiv.org/html/2601.21969v2)
+
+Expected upside
+- Token-Guard’s global iteration stage suggests many hallucinations are chain-level, not isolated local errors.
+
+Main risk
+- Fragment recomposition can produce awkward or incomplete answers even when each clause is individually supported.
+
+Judge focus
+- Inspect logical consistency across multi-hop answers and the quality of abstentions, not just surface factuality.
+
+## H81: Persistent Query State Contract
+
+Hypothesis
+- Carrying forward explicit per-thread constraints such as entities, time, metric, units, and source policy will improve MTRAG multi-turn accuracy by preventing retrieval drift across turns.
+
+Implementation sketch
+- Maintain a structured state object across turns and merge each new turn into it.
+- Use the merged state to rewrite retrieval queries, bias reranking, and filter evidence before prompting.
+- Keep state updates auditable so bad carryover can be analyzed quickly.
+- Tool source: [ContextGuard](https://github.com/ahmedjawedaj/contextguard)
+
+Expected upside
+- ContextGuard is designed around state-contracted retrieval, which directly matches multi-turn benchmark failure modes.
+
+Main risk
+- Stale constraints can overconstrain follow-up turns that intentionally shift topic.
+
+Judge focus
+- Check whether later turns preserve the correct entities and timeframes without reducing flexibility on topic shifts.
+
+## H82: Hard Constraint Evidence Gate
+
+Hypothesis
+- Rejecting retrieved chunks that violate persistent state constraints before answer generation will beat soft reranking alone on grounded multi-turn QA.
+
+Implementation sketch
+- Apply hard filters or large penalties for entity, time, or source-policy mismatches.
+- Enforce lightweight diversity rules so one noisy source cannot monopolize the prompt.
+- Log rejection reason codes for each gated chunk.
+- Tool source: [ContextGuard](https://github.com/ahmedjawedaj/contextguard)
+
+Expected upside
+- ContextGuard’s gate explicitly aims to stop off-contract evidence before it contaminates the answer step.
+
+Main risk
+- Metadata extraction errors can incorrectly block the only useful chunk.
+
+Judge focus
+- Compare evidence precision, contradiction rate, and final answer accuracy, not retrieval recall alone.
+
+## H83: Support + Counter-Evidence Retrieval
+
+Hypothesis
+- Planning both supportive and contradictory retrieval queries for each claim will reduce confirmation bias and improve robustness on comparison and conflict-heavy questions.
+
+Implementation sketch
+- Split the intended answer into one or more atomic claims.
+- Retrieve supporting evidence and explicit counter-evidence in parallel for each claim.
+- Feed both evidence types into the existing judge or answer-selection step before finalizing the response.
+- Tool source: [ContextGuard](https://github.com/ahmedjawedaj/contextguard)
+
+Expected upside
+- ContextGuard treats counter-evidence retrieval as a first-class primitive instead of assuming retrieval should only confirm the current hypothesis.
+
+Main risk
+- Counter-evidence queries can add noise when the original evidence was already sufficient and unambiguous.
+
+Judge focus
+- Check whether contradiction handling improves without a large recall collapse or token explosion.
+
+## H84: Coverage-Aware Claim Verdict Aggregation
+
+Hypothesis
+- Aggregating per-claim support and contradiction judgments into `SUPPORTED`, `CONTRADICTED`, `INSUFFICIENT`, or `MIXED` will improve calibration and abstention quality over a single scalar confidence score.
+
+Implementation sketch
+- Split the final answer into atomic claims.
+- Score each claim against accepted evidence, then aggregate using coverage and contradiction counts.
+- Use the aggregate label to decide whether to answer, abstain, or return a qualified answer with caveats.
+- Tool source: [ContextGuard](https://github.com/ahmedjawedaj/contextguard)
+
+Expected upside
+- Claim-level aggregation is a better control signal for faithfulness-focused metrics than raw model confidence.
+
+Main risk
+- Claim splitting and aggregation heuristics can become another brittle layer in the pipeline.
+
+Judge focus
+- Evaluate calibration, abstention quality, and faithfulness, not just EM or F1.
+

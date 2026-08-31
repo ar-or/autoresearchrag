@@ -39,6 +39,7 @@ HASH_LOOKUP_BATCH_SIZE = int(os.environ.get("HASH_LOOKUP_BATCH_SIZE", "1000"))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "100"))
 INDEX_BULK_BATCH_SIZE = int(os.environ.get("INDEX_BULK_BATCH_SIZE", "1000"))
 INGEST_DOC_BATCH_SIZE = int(os.environ.get("INGEST_DOC_BATCH_SIZE", "128"))
+SKIP_EXISTING_HASH_LOOKUP = os.environ.get("SKIP_EXISTING_HASH_LOOKUP", "0") == "1"
 INGEST_PREPARE_WORKERS = int(
     os.environ.get("INGEST_PREPARE_WORKERS", str(min(32, os.cpu_count() or 4)))
 )
@@ -422,6 +423,9 @@ def _prepare_batch_records(documents: list[dict]) -> list[dict]:
                     "fields": fields,
                 }
             )
+
+    if SKIP_EXISTING_HASH_LOOKUP:
+        return records
 
     existing_hash_ids = find_existing_hash_ids([record["hash_id"] for record in records])
     return [record for record in records if record["hash_id"] not in existing_hash_ids]

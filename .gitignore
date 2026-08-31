@@ -10,6 +10,8 @@ build/
 
 # Virtual environment
 .venv/
+.venv2/
+.wslenv/
 
 # Environment variables
 .env

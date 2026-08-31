@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "300"))
 EMBED_MODEL: str = "text-embedding-3-small"
 
 _openai = AsyncOpenAI(timeout=OPENAI_TIMEOUT_S, max_retries=2)
+_EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +302,11 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (a_norm * b_norm)
 
 
+async def _embed(texts: list[str]) -> list[list[float]]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EMBED_EXECUTOR, embed_batch, texts)
+
+
 async def _sentence_rerank_contexts(
     query: str,
     contexts: list[RetrievedContext],
@@ -308,7 +315,7 @@ async def _sentence_rerank_contexts(
     if not contexts:
         return contexts
 
-    query_vector = (await asyncio.to_thread(embed_batch, [query]))[0]
+    query_vector = (await _embed([query]))[0]
     sentence_texts: list[str] = []
     sentence_to_context: list[int] = []
     for index, context in enumerate(contexts):
@@ -318,7 +325,7 @@ async def _sentence_rerank_contexts(
     if not sentence_texts:
         return contexts[:top_k]
 
-    sentence_vectors = await asyncio.to_thread(embed_batch, sentence_texts)
+    sentence_vectors = await _embed(sentence_texts)
     best_scores = [-1.0] * len(contexts)
     for idx, vector in enumerate(sentence_vectors):
         context_index = sentence_to_context[idx]
@@ -371,17 +378,77 @@ async def _rewrite_retrieval_query(query: str) -> str:
         return query
 
 
-def _constraint_filter(
+def _answer_type_bonus(question: str, context: RetrievedContext) -> float:
+    lowered = question.lower()
+    haystack = f"{context.title} {context.text}".lower()
+    if lowered.startswith(("who", "whose")):
+        return 0.25 if re.search(r"\b[a-z]+ [a-z]+\b", haystack) else 0.0
+    if lowered.startswith("when") or re.search(r"\b\d{4}\b", lowered):
+        return 0.25 if re.search(r"\b\d{4}\b", haystack) else 0.0
+    if lowered.startswith("where"):
+        place_markers = (" in ", " at ", " city", " country", " state", " province")
+        return 0.25 if any(marker in haystack for marker in place_markers) else 0.0
+    if lowered.startswith(("is ", "was ", "were ", "did ", "does ")):
+        return 0.15 if any(token in haystack for token in ("yes", "no", "not", "did", "was")) else 0.0
+    return 0.0
+
+
+async def _coordinated_select_evidence(
     question: str,
     contexts: list[RetrievedContext],
+    top_k: int,
 ) -> list[RetrievedContext]:
+    if not contexts:
+        return []
+
     query_terms = _query_terms(question)
-    constrained = [
-        context
-        for context in contexts
-        if _context_overlap(query_terms, context) >= 1
-    ]
-    return constrained[:RETRIEVAL_K] or contexts[:RETRIEVAL_K]
+    query_vector = (await _embed([question]))[0]
+    scored: list[tuple[float, RetrievedContext]] = []
+    for context in contexts:
+        sentences = _split_sentences(context.text)[:4] or [context.text[:220]]
+        sentence_vectors = await _embed(sentences)
+        semantic = max((_cosine_similarity(query_vector, vec) for vec in sentence_vectors), default=0.0)
+        lexical = min(_context_overlap(query_terms, context) / max(len(query_terms), 1), 1.0) if query_terms else 0.0
+        score = (0.65 * semantic) + (0.25 * lexical) + _answer_type_bonus(question, context)
+        if lexical > 0:
+            score += 0.1
+        scored.append((score, context))
+
+    scored.sort(key=lambda item: (item[0], item[1].score), reverse=True)
+    selected: list[RetrievedContext] = []
+    seen: set[tuple[str, str, str]] = set()
+    for score, context in scored:
+        if score <= 0:
+            continue
+        key = _context_signature(context)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(context)
+        if len(selected) >= top_k:
+            break
+    return selected or contexts[:top_k]
+
+
+def _build_evidence_bounded_prompt(
+    question: str,
+    contexts: list[RetrievedContext],
+) -> str:
+    if not contexts:
+        return question
+    evidence_block = "\n\n".join(
+        f"[E{i+1}] {(context.title + ': ') if context.title else ''}{context.text}"
+        for i, context in enumerate(contexts)
+    )
+    return (
+        "Evidence (use only these passages for claims and supporting facts):\n"
+        f"{evidence_block}\n\n"
+        "Constraints:\n"
+        "- Ground every answer claim in the evidence above.\n"
+        "- If the evidence is insufficient, answer with the shortest supported answer possible.\n"
+        "- supporting_facts must cite only evidence sentences present above.\n\n"
+        f"User question: {question}"
+    )
 
 
 async def retrieve(
@@ -397,7 +464,7 @@ async def retrieve(
         retrieval_query = await _rewrite_retrieval_query(query)
         candidate_k = max(top_k * 3, top_k)
     try:
-        vector = (await asyncio.to_thread(embed_batch, [retrieval_query]))[0]
+        vector = (await _embed([retrieval_query]))[0]
         vector_hits = _es_vector_search(idx, vector, candidate_k)
         text_hits = _es_text_search(idx, retrieval_query, candidate_k)
         hits = _fuse_hits_rrf(vector_hits, text_hits, k=top_k)
@@ -408,9 +475,10 @@ async def retrieve(
             return []
     contexts = _hits_to_contexts(hits)
     try:
-        return await _sentence_rerank_contexts(retrieval_query, contexts, top_k)
+        reranked = await _sentence_rerank_contexts(retrieval_query, contexts, max(top_k * 2, top_k))
     except Exception:
-        return contexts[:top_k]
+        reranked = contexts[: max(top_k * 2, top_k)]
+    return await _coordinated_select_evidence(query, reranked, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -465,17 +533,11 @@ async def _run_agent(
 
     # 1. Pre-retrieval (always retrieve before agent runs)
     print(f"    [search] {user_message[:200]}")
-    contexts = _constraint_filter(user_message, await retrieve(user_message))
+    contexts = await retrieve(user_message)
     print(f"    [results] {len(contexts)} hits: {[c.title for c in contexts]}")
 
     # 2. Augment user message with retrieved context
-    augmented = user_message
-    if contexts:
-        block = "\n\n".join(
-            f"[{i+1}] {(c.title + ': ') if c.title else ''}{c.text}"
-            for i, c in enumerate(contexts)
-        )
-        augmented = f"Retrieved documents:\n{block}\n\nUser question: {user_message}"
+    augmented = _build_evidence_bounded_prompt(user_message, contexts)
 
     # 3. Build message list
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -521,8 +583,13 @@ async def _run_agent(
                     tc.function.name, tc.function.arguments
                 )
                 print(f"    [results] {len(tool_contexts)} hits: {[c.title for c in tool_contexts]}")
-                contexts.extend(tool_contexts)
-                latest_batch.extend(tool_contexts)
+                constrained_batch = await _coordinated_select_evidence(
+                    user_message,
+                    tool_contexts,
+                    RETRIEVAL_K,
+                )
+                contexts.extend(constrained_batch)
+                latest_batch.extend(constrained_batch)
                 messages.append(
                     {
                         "role": "tool",
